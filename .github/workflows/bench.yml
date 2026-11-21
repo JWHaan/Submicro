@@ -57,6 +57,13 @@ jobs:
           echo "--- sorted"
           echo "A(base): $(printf '%s\n' "${TA[@]}" | sort -n | tr '\n' ' ')"
           echo "B(head): $(printf '%s\n' "${TB[@]}" | sort -n | tr '\n' ' ')"
+      - name: Phase timing (1 run per side)
+        run: |
+          for side in base head; do
+            rm -rf out && mkdir -p out
+            echo "=== $side ==="
+            PHASE_TIMING=1 DATA_DIR=data OUTPUT_DIR=out NCPU=4 ./${side}-bin 2>&1 | grep '\[phase\]'
+          done
       - name: Spot-check outputs agree
         run: |
           rm -rf out_a out_b && mkdir -p out_a out_b
