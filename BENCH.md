@@ -55,3 +55,4 @@ numbers rank builds only. Authoritative: bench.yml x86 A/B + track score.
 ## event-balanced sessionize chunks — REVERTED (x86 regression)
 - 5b37ae0 replaced with_min_len(1<<16) run-count split with ~96 event-mass chunks to fix whale-run serialization on skewed data.
 - Combined A/B (above) showed ~4% regression; reverted to isolate — teardown v2 alone re-benched next.
+| Correctness: pending-field-at-EOF quote validation + saturating atoi (price overflow wrap) | adversarial EOF-quote + huge-price cases added to make_adv.py; fixtures 36/36, dev parity, diff 5/5, adversarial identical | committed d5fc335 (correctness, not perf) |
