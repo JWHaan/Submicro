@@ -1975,7 +1975,7 @@ fn write_user_part(
     ]));
     let f = fs::File::create(dir.join(format!("part-{}.parquet", part))).unwrap();
     let props = WriterProperties::builder()
-        .set_compression(Compression::UNCOMPRESSED)
+        .set_compression(Compression::SNAPPY)
         .build();
     let mut w = ArrowWriter::try_new(f, schema.clone(), Some(props)).unwrap();
     const CHUNK: usize = 2_000_000;
@@ -2089,7 +2089,7 @@ fn write_camp_part(
     ]));
     let f = fs::File::create(dir.join(format!("part-{}.parquet", part))).unwrap();
     let props = WriterProperties::builder()
-        .set_compression(Compression::UNCOMPRESSED)
+        .set_compression(Compression::SNAPPY)
         .build();
     let mut w = ArrowWriter::try_new(f, schema.clone(), Some(props)).unwrap();
     const CHUNK: usize = 2_000_000;
