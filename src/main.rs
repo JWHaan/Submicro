@@ -1553,6 +1553,7 @@ fn main() {
     let cat_tab_ref = &cat_tab;
     let total = ev_runs
         .par_iter()
+        .with_min_len(1 << 16)
         .fold(
             || Acc::new(n_days, n_camps, day_lo),
             |mut acc, &(person, lo, hi)| {
