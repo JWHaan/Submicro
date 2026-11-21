@@ -1,0 +1,67 @@
+name: bench
+# A/B this commit against another on a real x86-64 runner.
+#   gh workflow run bench.yml -f base=<commit> [-f events=20000000] [-f runs=7]
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Commit/branch to compare against (A); this checkout is B
+        required: true
+      events:
+        description: Events in the dataset
+        default: "20000000"
+      runs:
+        description: Timed runs of each side (interleaved)
+        default: "7"
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Machine
+        run: |
+          lscpu | grep -E 'Model name|^CPU\(s\)|L3'
+          grep -m1 -o -w -E 'avx2|bmi2|avx512f' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          free -g | sed -n 2p
+      - name: Build both
+        run: |
+          cargo build --release --bin shopping-sessions --bin synth 2>&1 | tail -1
+          cp target/release/shopping-sessions head-bin
+          cp target/release/synth synth
+          git worktree add -q ../base "${{ inputs.base }}"
+          (cd ../base && cargo build --release --bin shopping-sessions 2>&1 | tail -1)
+          cp ../base/target/release/shopping-sessions base-bin
+          ls -la *-bin synth
+      - name: Dataset
+        run: |
+          ./synth --events ${{ inputs.events }} --clicks $(( ${{ inputs.events }} / 4 )) --seed 9 --output data
+          du -sh data/events data/clicks data/links
+          cat data/events/* data/clicks/* data/links/* > /dev/null
+      - name: A/B interleaved
+        run: |
+          declare -A TA TB
+          for i in $(seq ${{ inputs.runs }}); do
+            for side in base head; do
+              rm -rf out && mkdir -p out
+              s=$(date +%s%N)
+              DATA_DIR=data OUTPUT_DIR=out NCPU=4 ./${side}-bin
+              e=$(date +%s%N)
+              ms=$(( (e - s) / 1000000 ))
+              echo "run $i $side: ${ms} ms"
+              [ "$side" = base ] && TA[$i]=$ms || TB[$i]=$ms
+            done
+          done
+          echo "--- sorted"
+          echo "A(base): $(printf '%s\n' "${TA[@]}" | sort -n | tr '\n' ' ')"
+          echo "B(head): $(printf '%s\n' "${TB[@]}" | sort -n | tr '\n' ' ')"
+      - name: Spot-check outputs agree
+        run: |
+          rm -rf out_a out_b && mkdir -p out_a out_b
+          DATA_DIR=data OUTPUT_DIR=out_a NCPU=4 ./base-bin
+          DATA_DIR=data OUTPUT_DIR=out_b NCPU=4 ./head-bin
+          find out_a -name '*.parquet' | sort > /tmp/fa
+          find out_b -name '*.parquet' | sort > /tmp/fb
+          diff /tmp/fa /tmp/fb && echo "same file layout"
