@@ -1175,11 +1175,13 @@ fn main() {
             tasks.push(Task { file: fi, cs, ce });
         }
     }
-    let task_rows: Vec<Vec<RawEv>> = tasks
+    let shard_of = |eid: u64| (fx64(eid) as usize) & (NSHARD - 1);
+    let parsed: Vec<(Vec<RawEv>, Vec<u32>)> = tasks
         .par_iter()
         .map(|t| {
             let b = buf(t.file);
             let mut rows: Vec<RawEv> = Vec::with_capacity((t.ce - t.cs) / 64);
+            let mut cnt = vec![0u32; NSHARD];
             let lo = t.cs;
             each_line(b, t.cs, t.ce, t.cs == 0, 7, |fields, b| {
                 let get = |i: usize| -> &[u8] {
@@ -1243,8 +1245,10 @@ fn main() {
                 } else {
                     1
                 };
+                let ek = key_of(eid);
+                cnt[shard_of(ek)] += 1;
                 rows.push(RawEv {
-                    eid: key_of(eid),
+                    eid: ek,
                     uid: key_of(uid),
                     prod: prod_key,
                     ingest,
@@ -1255,25 +1259,16 @@ fn main() {
                     _p: [0; 6],
                 });
             });
-            rows
+            (rows, cnt)
         })
         .collect();
+    let (task_rows, cnts): (Vec<Vec<RawEv>>, Vec<Vec<u32>>) =
+        parsed.into_iter().unzip();
 
     pt!("ev_parse");
 
     // single-arena scatter by eid-hash: per-task histograms -> global offsets
     // -> each task writes directly into its disjoint (task, shard) region.
-    let shard_of = |eid: u64| (fx64(eid) as usize) & (NSHARD - 1);
-    let cnts: Vec<Vec<u32>> = task_rows
-        .par_iter()
-        .map(|v| {
-            let mut c = vec![0u32; NSHARD];
-            for r in v {
-                c[shard_of(r.eid)] += 1;
-            }
-            c
-        })
-        .collect();
     let nt = task_rows.len();
     // prefix[t][s] = rows of shard s contributed by tasks 0..t
     let mut prefix = vec![vec![0u32; NSHARD]; nt + 1];
