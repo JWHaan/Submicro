@@ -121,3 +121,22 @@ numbers rank builds only. Authoritative: bench.yml x86 A/B + track score.
 - output_rows still ~470-700ms depending on CPU: remaining fat is Arrow
   RecordBatch materialization + parquet-rs encode pipeline => hand-rolled
   writer is still the lever there.
+
+## WS-C owned large mappings — experimental, unmeasured
+- Based on `73dd703`: Linux allocations >=1 MiB use private anonymous mappings
+  with a best-effort THP hint. Exact power-of-two dead mappings from 1 through
+  32 MiB have one reuse slot each (at most 63 MiB cached). Small allocations
+  stay with mimalloc. At exit, drop owned buffers rather than advising pages
+  through still-live vectors.
+- Native macOS and Docker Linux/arm64 release builds (`-j2`) passed. Linux
+  allocator tests: 3 passed (dirty reuse/zeroing, alignment and threshold
+  crossings, failed resize preserving the original). Public dev on Linux/arm64:
+  exit 0, empty stdout, CSV headers and row multisets match dev-answer (117038
+  user rows, 27400 campaign rows); all 8 Parquet parts byte-identical to the
+  macOS mimalloc path at NCPU=4.
+- After that dev run, added advisory `MAP_NORESERVE` (no exemption from the
+  cgroup memory limit); Linux/arm64 release allocator tests passed 3/3 again,
+  and the release application rebuilt with `-j2`.
+- Not a wall-time or peak-memory measurement. Full differential/fixtures and
+  Linux/amd64 20M/60M performance/RSS gates remain with the coordinator. No
+  keep/revert or 310 ms claim.
