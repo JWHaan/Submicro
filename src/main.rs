@@ -1838,8 +1838,44 @@ fn main() {
         );
     }
     pt!("write");
+    parallel_teardown();
     std::process::exit(0);
 }
+
+/// Free every large mapping across all threads so the kernel's serial VMA
+/// teardown at exit has no pages left to zap. Linux only; no-op elsewhere.
+#[cfg(target_os = "linux")]
+fn parallel_teardown() {
+    let Ok(maps) = fs::read_to_string("/proc/self/maps") else {
+        return;
+    };
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for line in maps.lines() {
+        let Some(dash) = line.find('-') else { continue };
+        let Ok(s) = usize::from_str_radix(&line[..dash], 16) else {
+            continue;
+        };
+        let rest = &line[dash + 1..];
+        let Some(sp) = rest.find(' ') else { continue };
+        let Ok(e) = usize::from_str_radix(&rest[..sp], 16) else {
+            continue;
+        };
+        if e.saturating_sub(s) >= (64 << 20) {
+            ranges.push((s, e));
+        }
+    }
+    ranges.par_iter().for_each(|&(s, e)| unsafe {
+        let mut p = s;
+        while p < e {
+            let n = std::cmp::min(e - p, 32 << 20);
+            libc::madvise(p as *mut _, n, libc::MADV_DONTNEED);
+            p += n;
+        }
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+fn parallel_teardown() {}
 
 fn str_of(b: &[u8]) -> &str {
     unsafe { std::str::from_utf8_unchecked(b) }
