@@ -22,6 +22,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, Encoding};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
+mod plain_writer;
 mod scanner;
 use scanner::each_line;
 
@@ -1605,12 +1606,20 @@ fn main() {
     pt!("sessionize");
 
     // ---------------- outputs ----------------
+    let codec = plain_writer::selected_codec();
     let mut ud_groups = total.ud_groups;
-    ud_groups.par_sort_unstable_by(|a, b| key_cmp(a.0, b.0));
-    let mut goff: Vec<u32> = Vec::with_capacity(ud_groups.len() + 1);
-    goff.push(0);
-    for &(_, _, l) in &ud_groups {
-        goff.push(goff.last().unwrap() + l);
+    // The Parquet tables are unordered. The direct writer can consume the
+    // accumulator's dense rows in place; only the reference/CSV use sorted IDs.
+    if codec.is_none() || write_csv {
+        ud_groups.par_sort_unstable_by(|a, b| key_cmp(a.0, b.0));
+    }
+    let mut goff = Vec::new();
+    if codec.is_none() {
+        goff.reserve(ud_groups.len() + 1);
+        goff.push(0);
+        for &(_, _, l) in &ud_groups {
+            goff.push(goff.last().unwrap() + l);
+        }
     }
     let ud_rows: Vec<(u64, i64, u64, u64, i64, Option<u32>)> = if write_csv {
         let mut ud_rows = Vec::with_capacity(total.ud_out.len());
@@ -1643,22 +1652,29 @@ fn main() {
             &camp_names[c as usize]
         }
     };
-    cd_rows.sort_by(|a, b| cn(a.0).cmp(cn(b.0)).then(a.1.cmp(&b.1)));
+    if codec.is_none() || write_csv {
+        cd_rows.sort_by(|a, b| cn(a.0).cmp(cn(b.0)).then(a.1.cmp(&b.1)));
+    }
 
     fs::create_dir_all(outdir.join("user_daily")).unwrap();
     fs::create_dir_all(outdir.join("campaign_daily")).unwrap();
-    rayon::join(
-        || write_user_parquet(&outdir.join("user_daily"), &total.ud_out, &ud_groups, &goff, &cat_tab),
-        || {
-            write_camp_parquet(
-                &outdir.join("campaign_daily"),
-                &cd_rows,
-                &camp_names,
-                &camp_chan,
-                organic_camp,
-            )
-        },
-    );
+    let ud = outdir.join("user_daily");
+    let cd = outdir.join("campaign_daily");
+    if let Some(codec) = codec {
+        rayon::join(
+            || plain_writer::parts(&ud, &total.ud_out, |out, rows| {
+                plain_writer::users(out, rows, &cat_tab, codec)
+            }),
+            || plain_writer::parts(&cd, &cd_rows, |out, rows| {
+                plain_writer::campaigns(out, rows, &camp_names, &camp_chan, organic_camp, codec)
+            }),
+        );
+    } else {
+        rayon::join(
+            || write_user_parquet(&ud, &total.ud_out, &ud_groups, &goff, &cat_tab),
+            || write_camp_parquet(&cd, &cd_rows, &camp_names, &camp_chan, organic_camp),
+        );
+    }
     pt!("output_rows");
     if write_csv {
         write_csvs(

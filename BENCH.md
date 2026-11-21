@@ -121,3 +121,19 @@ numbers rank builds only. Authoritative: bench.yml x86 A/B + track score.
 - output_rows still ~470-700ms depending on CPU: remaining fat is Arrow
   RecordBatch materialization + parquet-rs encode pipeline => hand-rolled
   writer is still the lever there.
+
+## WS-B direct Parquet writer — experiment, timing pending
+- Branch `exp/hot-writer` from `73dd703`. `PARQUET_WRITER=snappy` (also the
+  default) writes raw Snappy blocks, `uncompressed` writes verbatim pages,
+  `arrow` uses the original Arrow writer. No image or CI script change.
+- Both tables use PLAIN data pages v1 and compact Thrift metadata. Pages target
+  256 KiB; a single long string may exceed that but not the signed page-size
+  limit. The direct path consumes accumulator order, since row order does not
+  matter. `WRITE_CSV=1` retains the baseline's CSV ordering.
+- Local writer gate: 5 Rust tests pass. PyArrow 21 decoded all three modes from
+  the same native binary on `synth` seed 13 (160k events/22k clicks, NCPU=3):
+  both direct modes matched Arrow data and schemas (84,569 user rows and 20,628
+  campaign rows, three parts each). Header-only events/clicks produced one
+  schema-matching empty part per table in each mode.
+- No performance result or keep decision yet. Full fixtures, official dev
+  answer, differential oracle and paired x86 timings are coordinator gates.
