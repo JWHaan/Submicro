@@ -84,7 +84,8 @@ fn unpack(k: u64, out: &mut [u8; 10]) -> usize {
 
 #[inline]
 fn fx64(k: u64) -> u64 {
-    k.wrapping_mul(0x9E3779B97F4A7C15)
+    let h = k.wrapping_mul(0x9E3779B97F4A7C15);
+    h ^ (h >> 33)
 }
 
 fn fxh(s: &[u8]) -> u64 {
@@ -1301,13 +1302,21 @@ fn main() {
 
     let prod_map_ref = &prod_map;
     let arena_ref = &arena;
+    let keeps: Vec<Vec<u32>> = (0..NSHARD)
+        .into_par_iter()
+        .map(|s| {
+            let rows = &arena_ref[base_ref[s] as usize..base_ref[s + 1] as usize];
+            dedup_min(rows, |r| r.ingest)
+        })
+        .collect();
+    pt!("ev_dedup");
+    let keeps_ref = &keeps;
     let evs: Vec<Ev> = (0..NSHARD)
         .into_par_iter()
         .flat_map(|s| {
             let rows = &arena_ref[base_ref[s] as usize..base_ref[s + 1] as usize];
-            let keep_idx = dedup_min(rows, |r| r.ingest);
-            let mut out = Vec::with_capacity(keep_idx.len());
-            for &i in &keep_idx {
+            let mut out = Vec::with_capacity(keeps_ref[s].len());
+            for &i in &keeps_ref[s] {
                 let d = rows[i as usize];
                 if d.uid == 0 || d.prod == 0 || d.etype == 3 || d.ts == T_INVALID || d.ts < ws
                     || d.ts >= we
@@ -1339,7 +1348,7 @@ fn main() {
             out
         })
         .collect();
-    pt!("ev_dedup_filter");
+    pt!("ev_filter");
     let evs = shard_sort::<Ev, 256>(evs, |e| e.person, EV_E, |a, b| {
         (a.person, a.ts).cmp(&(b.person, b.ts))
     });
