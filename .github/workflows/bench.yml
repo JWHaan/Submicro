@@ -68,11 +68,12 @@ jobs:
         run: |
           cd "$LAB"
           export IMAGE=bench-head MEM=12g
-          env/bin/python starter-duckdb/scripts/run_fixtures.py starter-duckdb/fixtures -- starter-duckdb/scripts/docker_run.sh
+          sudo env IMAGE=bench-head MEM=12g env/bin/python starter-duckdb/scripts/run_fixtures.py starter-duckdb/fixtures -- starter-duckdb/scripts/docker_run.sh
           generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output dev
           starter-duckdb/scripts/docker_run.sh dev dev-out > dev.stdout
           test ! -s dev.stdout
           env/bin/python starter-duckdb/scripts/compare.py dev-out dev-answer
+          sudo rm -rf dev-out
       - name: Generate practice or final-size input
         run: |
           cd "$LAB"
