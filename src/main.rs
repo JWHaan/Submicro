@@ -370,28 +370,22 @@ fn parse_ts(s: &[u8]) -> i64 {
 // Records
 // ---------------------------------------------------------------------------
 #[derive(Clone, Copy)]
-struct RawEv {
-    eid: u64,   // event_id key (0 impossible — empty eids dropped)
-    uid: u64,   // user_id key, 0 = empty
-    prod: u64,  // product key, 0 = empty
+struct FEv {
+    uid: u64,  // user_id key, 0 = empty
+    prod: u64, // product key, 0 = empty
     ts: i64,
-    ingest: i64,
     price: u32,
     etype: u8, // 0 view,1 cart,2 purchase,3 bad
     pflag: u8, // 0 null,1 ok,2 bad
-    _p: [u8; 6],
+    stale: u8, // wrapping(ingest - ts) > D24; only read for valid in-window ts
+    _p: u8,
 }
-const RAWE_E: RawEv = RawEv {
-    eid: 0,
-    uid: 0,
-    prod: 0,
-    ts: 0,
-    ingest: 0,
-    price: 0,
-    etype: 0,
-    pflag: 0,
-    _p: [0; 6],
-};
+// Dedup scatter source: eid+ingest only. gidx is implicit (task base + index).
+#[derive(Clone, Copy)]
+struct DIn {
+    eid: u64,
+    ingest: i64,
+}
 
 #[derive(Clone, Copy)]
 struct Ev {
@@ -400,12 +394,7 @@ struct Ev {
     cat: u32,
     price: u32,
 }
-const EV_E: Ev = Ev {
-    person: 0,
-    ts: 0,
-    cat: 0,
-    price: 0,
-};
+
 
 #[derive(Clone, Copy)]
 struct RawCl {
@@ -1182,11 +1171,12 @@ fn main() {
         }
     }
     let shard_of = |eid: u64| (fx64(eid) as usize) & (NSHARD - 1);
-    let parsed: Vec<(Vec<RawEv>, Vec<u32>)> = tasks
+    let parsed: Vec<(Vec<FEv>, Vec<DIn>, Vec<u32>)> = tasks
         .par_iter()
         .map(|t| {
             let b = buf(t.file);
-            let mut rows: Vec<RawEv> = Vec::with_capacity((t.ce - t.cs) / 64);
+            let mut rows: Vec<FEv> = Vec::with_capacity((t.ce - t.cs) / 64);
+            let mut din: Vec<DIn> = Vec::with_capacity((t.ce - t.cs) / 64);
             let mut cnt = vec![0u32; NSHARD];
             let lo = t.cs;
             each_line(b, t.cs, t.ce, t.cs == 0, 7, |fields, b| {
@@ -1253,23 +1243,29 @@ fn main() {
                 };
                 let ek = key_of(eid);
                 cnt[shard_of(ek)] += 1;
-                rows.push(RawEv {
-                    eid: ek,
+                rows.push(FEv {
                     uid: key_of(uid),
                     prod: prod_key,
-                    ingest,
                     ts,
                     price: pv,
                     etype,
                     pflag,
-                    _p: [0; 6],
+                    stale: (ingest.wrapping_sub(ts) > D24) as u8,
+                    _p: 0,
                 });
+                din.push(DIn { eid: ek, ingest });
             });
-            (rows, cnt)
+            (rows, din, cnt)
         })
         .collect();
-    let (task_rows, cnts): (Vec<Vec<RawEv>>, Vec<Vec<u32>>) =
-        parsed.into_iter().unzip();
+    let mut task_rows = Vec::with_capacity(parsed.len());
+    let mut dins = Vec::with_capacity(parsed.len());
+    let mut cnts = Vec::with_capacity(parsed.len());
+    for (r, d, c) in parsed {
+        task_rows.push(r);
+        dins.push(d);
+        cnts.push(c);
+    }
 
     pt!("ev_parse");
 
@@ -1300,6 +1296,7 @@ fn main() {
     let mut arena: Vec<DRec> = Vec::with_capacity(total);
     let arena_ptr = RawPtr::<DRec>(arena.as_mut_ptr() as usize, std::marker::PhantomData);
     let task_rows_ref = &task_rows;
+    let dins_ref = &dins;
     let base_ref = &base;
     let prefix_ref = &prefix;
     let tbase_ref = &tbase;
@@ -1310,7 +1307,7 @@ fn main() {
         }
         let g0 = tbase_ref[t];
         let dst = arena_ptr.0 as *mut DRec;
-        for (j, r) in task_rows_ref[t].iter().enumerate() {
+        for (j, r) in dins_ref[t].iter().enumerate() {
             let s = shard_of(r.eid);
             unsafe {
                 *dst.add(off[s] as usize) = DRec {
@@ -1325,6 +1322,7 @@ fn main() {
     unsafe { arena.set_len(total) };
     drop(cnts);
     drop(prefix);
+    drop(dins);
     pt!("ev_scatter");
 
     // per-eid-shard dedup -> mark surviving flat indices
@@ -1363,7 +1361,7 @@ fn main() {
                 {
                     continue;
                 }
-                if d.ingest - d.ts > D24 {
+                if d.stale != 0 {
                     continue;
                 }
                 if d.etype == 2 && d.pflag != 1 {
