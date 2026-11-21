@@ -91,3 +91,7 @@ numbers rank builds only. Authoritative: bench.yml x86 A/B + track score.
 ## in-Docker PGO — REVERTED (build failure under emulation)
 - 11749be's instrumented training run exited 101 inside docker build on an ARM Mac building linux/amd64 (qemu-user): the synth layer runs fine, the profile-generate run panics under emulation. x86 CI had built it fine (run 44908070010) and measured it a wash (~0.4%, noise) — zero measured upside to justify a build-time failure mode.
 - Reverted the Dockerfile to the single cargo-build shape of be363ff. mimalloc env (be9c190) and date-prefix cache (aa038e4) unaffected. If PGO is revisited, gate the training run behind a fallback so a failed profile capture degrades to a non-PGO build rather than failing the image.
+
+## track score: 2.54s (submitted commit)
+- User submitted the post-revert lineage (master tip 3014a7a / 3d25bf7-family: mimalloc env + date-prefix cache, PGO reverted out of Dockerfile). Track page returned **2.54s** vs the previous 2.77s.
+- Consistent with the CI A/Bs (mimalloc ~1.3%, datecache ~2.3% medians at 20M NCPU=4) plus scorer variance.
