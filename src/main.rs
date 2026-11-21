@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
-use memchr::{memchr, memchr3, memmem};
+use memchr::{memchr, memmem};
 use memmap2::Mmap;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHasher};
@@ -21,6 +21,9 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, Encoding};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
+
+mod scanner;
+use scanner::each_line;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -606,173 +609,6 @@ fn json_str<'a>(j: &'a [u8], key: &str) -> Option<&'a [u8]> {
     Some(&rest[q1 + 1..q1 + 1 + q2])
 }
 
-// ---------------------------------------------------------------------------
-// Tokenizer: one pass over a chunk via memchr3(',', '"', '\n'). Emits parsed
-// field slices per line. Quotes only legal as whole-field wrappers.
-// ---------------------------------------------------------------------------
-/// Parse all lines of `b[pos..end)` into `f(out, fields)` — fields are
-/// Option<(off,len)> into b. Returns after processing the whole range.
-/// `hdr` skips a header line when pos==0.
-#[inline]
-fn each_line<F: FnMut(&[Option<(u32, u32)>; 8], &[u8])>(
-    b: &[u8],
-    lo: usize,
-    hi: usize,
-    hdr: bool,
-    ncols: usize,
-    mut f: F,
-) {
-    let mut pos = lo;
-    if hdr && pos == 0 {
-        match memchr(b'\n', &b[..hi]) {
-            Some(p) => pos = p + 1,
-            None => return,
-        }
-    }
-    let mut fields: [Option<(u32, u32)>; 8] = [None; 8];
-    let mut n = 0usize;
-    let mut fstart = pos;
-    let mut q = 0u32;
-    let mut ffirst = 0u8;
-    let mut flast = 0u8;
-    let mut ok = true;
-    let mut p = pos;
-    while p < hi {
-        let d = match memchr3(b',', b'"', b'\n', &b[p..hi]) {
-            Some(x) => p + x,
-            None => hi,
-        };
-        if d == hi {
-            // tail of file without newline: last field runs to hi
-            let flen = hi - fstart;
-            if n < ncols {
-                ok = ok && field_ok(&b[fstart..hi], q, flen);
-                if ok {
-                    let (o, l) = field_span(&b[fstart..hi], q, flen);
-                    fields[n] = if o == u32::MAX {
-                        None
-                    } else {
-                        Some(((fstart - lo) as u32 + o, l))
-                    };
-                    n += 1;
-                }
-            } else {
-                ok = false;
-            }
-            if n == ncols && ok {
-                f(&fields, b);
-            }
-            return;
-        }
-        let c = b[d];
-        if c == b'"' {
-            if d == fstart {
-                ffirst = 1;
-            }
-            flast = 1;
-            q += 1;
-            p = d + 1;
-            continue;
-        }
-        if c == b',' {
-            if n >= ncols {
-                ok = false;
-                n += 1;
-            } else {
-                let flen = d - fstart;
-                ok = ok && field_ok(&b[fstart..d], q, flen);
-                if ok {
-                    let (o, l) = field_span(&b[fstart..d], q, flen);
-                    fields[n] = if o == u32::MAX {
-                        None
-                    } else {
-                        Some(((fstart - lo) as u32 + o, l))
-                    };
-                    n += 1;
-                } else {
-                    n += 1;
-                }
-            }
-            fstart = d + 1;
-            q = 0;
-            ffirst = 0;
-            flast = 0;
-            p = d + 1;
-            continue;
-        }
-        // '\n': finalize last field + emit
-        let flen = d - fstart;
-        if n < ncols {
-            ok = ok && field_ok(&b[fstart..d], q, flen);
-            if ok {
-                let (o, l) = field_span(&b[fstart..d], q, flen);
-                fields[n] = if o == u32::MAX {
-                    None
-                } else {
-                    Some(((fstart - lo) as u32 + o, l))
-                };
-                n += 1;
-            }
-        } else {
-            ok = false;
-        }
-        let _ = (ffirst, flast);
-        if n == ncols && ok {
-            f(&fields, b);
-        }
-        n = 0;
-        ok = true;
-        q = 0;
-        ffirst = 0;
-        flast = 0;
-        fstart = d + 1;
-        p = d + 1;
-    }
-    // File ended right after a delimiter: one pending field remains — run the
-    // same validation as the newline path (a trailing quote can make it
-    // malformed; an empty tail becomes null).
-    if n > 0 && n < ncols {
-        let flen = hi - fstart;
-        ok = ok && field_ok(&b[fstart..hi], q, flen);
-        if ok {
-            let (o, l) = field_span(&b[fstart..hi], q, flen);
-            fields[n] = if o == u32::MAX {
-                None
-            } else {
-                Some(((fstart - lo) as u32 + o, l))
-            };
-            n += 1;
-            if n == ncols {
-                f(&fields, b);
-            }
-        }
-    }
-}
-
-/// Field validity: unquoted -> no quotes; quoted -> exactly `"..."` with no
-/// inner quotes (q==2 and wrapper positions).
-#[inline]
-fn field_ok(s: &[u8], q: u32, flen: usize) -> bool {
-    q == 0 || (q == 2 && flen >= 2 && s[0] == b'"' && s[flen - 1] == b'"')
-}
-
-/// Span of the value inside the field; (u32::MAX,0) = empty/null.
-#[inline]
-fn field_span(s: &[u8], q: u32, flen: usize) -> (u32, u32) {
-    if flen == 0 {
-        return (u32::MAX, 0);
-    }
-    if q == 2 {
-        let inner = flen - 2;
-        if inner == 0 {
-            return (u32::MAX, 0);
-        }
-        let _ = s;
-        return (1, inner as u32);
-    }
-    (0, flen as u32)
-}
-
 /// Byte ranges aligned to line starts.
 fn line_chunks(b: &[u8], n: usize) -> Vec<(usize, usize)> {
     let mut v = Vec::new();
@@ -1113,10 +949,8 @@ fn main() {
     let mut prod_map = U64Map::new(4096);
     {
         let b = buf(prod_f);
-        each_line(b, 0, b.len(), true, 2, |fields, b| {
-            if let (Some(po), Some(co)) = (fields[0], fields[1]) {
-                let prod = &b[po.0 as usize..(po.0 + po.1) as usize];
-                let cat = &b[co.0 as usize..(co.0 + co.1) as usize];
+        each_line(b, 0, b.len(), true, |&[prod, cat]| {
+            if !prod.is_empty() && !cat.is_empty() {
                 let ci = intern_cat(cat);
                 prod_map.insert(key_of(prod), ci as u64); // last wins
             }
@@ -1129,10 +963,8 @@ fn main() {
     let mut camp_map = U64Map::new(4096);
     {
         let b = buf(camp_f);
-        each_line(b, 0, b.len(), true, 2, |fields, b| {
-            if let (Some(co), Some(ho)) = (fields[0], fields[1]) {
-                let cid = &b[co.0 as usize..(co.0 + co.1) as usize];
-                let ch = &b[ho.0 as usize..(ho.0 + ho.1) as usize];
+        each_line(b, 0, b.len(), true, |&[cid, ch]| {
+            if !cid.is_empty() && !ch.is_empty() {
                 let k = key_of(cid);
                 match camp_map.get(k) {
                     Some(i) => camp_chan[i as usize] = ch.into(),
@@ -1164,13 +996,8 @@ fn main() {
             .flat_map(|&(f, cs, ce)| {
                 let b = buf(f);
                 let mut out = Vec::new();
-                each_line(b, cs, ce, cs == 0, 2, |fields, b| {
-                    if let (Some(ao), Some(bo)) = (fields[0], fields[1]) {
-                        if ao.1 == 0 || bo.1 == 0 {
-                            return;
-                        }
-                        let a = &b[cs + ao.0 as usize..cs + (ao.0 + ao.1) as usize];
-                        let bb = &b[cs + bo.0 as usize..cs + (bo.0 + bo.1) as usize];
+                each_line(b, cs, ce, cs == 0, |&[a, bb]| {
+                    if !a.is_empty() && !bb.is_empty() {
                         out.push((key_of(a), key_of(bb)));
                     }
                 });
@@ -1253,48 +1080,24 @@ fn main() {
             let mut rows: Vec<FEv> = Vec::with_capacity((t.ce - t.cs) / 64);
             let mut din: Vec<DIn> = Vec::with_capacity((t.ce - t.cs) / 64);
             let mut cnt = vec![0u32; NSHARD];
-            let lo = t.cs;
-            each_line(b, t.cs, t.ce, t.cs == 0, 7, |fields, b| {
-                let get = |i: usize| -> &[u8] {
-                    match fields[i] {
-                        Some((o, l)) => &b[lo + o as usize..lo + (o + l) as usize],
-                        None => &[],
-                    }
-                };
-                let (eid, uid, ts_s, ing_s, et_s, prod, price) = (
-                    get(0),
-                    get(1),
-                    get(2),
-                    get(3),
-                    get(4),
-                    get(5),
-                    get(6),
-                );
-                if eid.is_empty() || fields[0].is_none() {
+            each_line(b, t.cs, t.ce, t.cs == 0, |&[eid, uid, ts_s, ing_s, et_s, prod, price]| {
+                if eid.is_empty() {
                     return;
                 }
-                let ingest = if fields[3].is_some() {
-                    parse_ts(ing_s)
-                } else {
-                    return;
-                };
+                let ingest = parse_ts(ing_s);
                 if ingest == T_INVALID {
                     return;
                 }
-                let ts = if fields[2].is_some() {
-                    parse_ts(ts_s)
-                } else {
-                    T_INVALID
-                };
+                let ts = parse_ts(ts_s);
                 let etype = match et_s {
                     b"view" => 0u8,
                     b"cart" => 1,
                     b"purchase" => 2,
                     _ => 3,
                 };
-                let (pv, pflag) = match fields[6] {
-                    None => (0u32, 0u8),
-                    Some(_) => {
+                let (pv, pflag) = match price {
+                    [] => (0u32, 0u8),
+                    _ => {
                         if is_digits(price) {
                             let v = atoi(price);
                             if v >= 1 && v <= 10_000_000 {
@@ -1527,33 +1330,21 @@ fn main() {
         .map(|t| {
             let b = buf(t.file);
             let mut rows: Vec<RawCl> = Vec::with_capacity((t.ce - t.cs) / 48);
-            let lo = t.cs;
-            each_line(b, t.cs, t.ce, t.cs == 0, 4, |fields, b| {
-                let get = |i: usize| -> &[u8] {
-                    match fields[i] {
-                        Some((o, l)) => &b[lo + o as usize..lo + (o + l) as usize],
-                        None => &[],
-                    }
-                };
-                let (cid, uid, camp, ts_s) = (get(0), get(1), get(2), get(3));
-                if cid.is_empty() || fields[0].is_none() {
+            each_line(b, t.cs, t.ce, t.cs == 0, |&[cid, uid, camp, ts_s]| {
+                if cid.is_empty() {
                     return;
                 }
                 rows.push(RawCl {
                     cid: key_of(cid),
                     uid: key_of(uid),
-                    camp: match fields[2] {
-                        Some(_) => {
+                    camp: match camp {
+                        [] => u32::MAX,
+                        _ => {
                             let ck = key_of(camp);
                             camp_map_ref.get(ck).map(|v| v as u32).unwrap_or(u32::MAX)
                         }
-                        None => u32::MAX,
                     },
-                    ts: if fields[3].is_some() {
-                        parse_ts(ts_s)
-                    } else {
-                        T_INVALID
-                    },
+                    ts: parse_ts(ts_s),
                     _p: 0,
                 });
             });
