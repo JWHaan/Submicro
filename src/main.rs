@@ -731,14 +731,15 @@ fn line_chunks(b: &[u8], n: usize) -> Vec<(usize, usize)> {
 // Accumulators
 // ---------------------------------------------------------------------------
 #[derive(Default)]
-struct UdAcc {
+struct UdCell {
     sessions: u64,
     events: u64,
     rev: i64,
-    cats: FxHashMap<u32, i64>,
+    cats: Vec<(u32, i64)>,
+    used: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct CdAcc {
     sessions: u64,
     purch: u64,
@@ -746,21 +747,11 @@ struct CdAcc {
     assist: u64,
 }
 
+#[derive(Default)]
 struct Session {
     start: i64,
     n: u64,
     rev: i64,
-    cats: FxHashMap<u32, i64>,
-}
-impl Default for Session {
-    fn default() -> Self {
-        Session {
-            start: 0,
-            n: 0,
-            rev: 0,
-            cats: FxHashMap::default(),
-        }
-    }
 }
 
 #[derive(Default)]
@@ -808,8 +799,10 @@ impl Alive {
 
 #[derive(Default)]
 struct Acc {
-    ud: FxHashMap<(u64, i64), UdAcc>,
-    cd: FxHashMap<u64, CdAcc>,
+    ud_out: Vec<(u64, i64, u64, u64, i64, Option<u32>)>,
+    cd: Vec<CdAcc>,
+    cells: Vec<UdCell>,
+    touched: Vec<u32>,
     sessions: Vec<(i64, i64, i64)>,
     ats: Vec<i64>,
     acamp: Vec<u32>,
@@ -817,44 +810,45 @@ struct Acc {
     ccamp: Vec<u32>,
     cur: Session,
     alive: Alive,
+    day_lo: i64,
 }
 impl Acc {
+    fn new(n_days: usize, n_camps: u32, day_lo: i64) -> Self {
+        let mut a = Acc::default();
+        a.cd = vec![CdAcc::default(); (n_camps as usize + 1) * n_days];
+        a.cells = (0..n_days).map(|_| UdCell::default()).collect();
+        a.alive = Alive::new(n_camps);
+        a.day_lo = day_lo;
+        a
+    }
     fn merge(&mut self, o: Acc) {
-        for (k, a) in o.ud {
-            let e = self.ud.entry(k).or_default();
-            e.sessions += a.sessions;
-            e.events += a.events;
-            e.rev += a.rev;
-            for (c, v) in a.cats {
-                *e.cats.entry(c).or_insert(0) += v;
-            }
+        self.ud_out.extend(o.ud_out);
+        if self.cd.len() < o.cd.len() {
+            self.cd = o.cd;
+            return;
         }
-        for (k, a) in o.cd {
-            let e = self.cd.entry(k).or_default();
-            e.sessions += a.sessions;
-            e.purch += a.purch;
-            e.rev += a.rev;
-            e.assist += a.assist;
+        for (a, b) in self.cd.iter_mut().zip(o.cd.iter()) {
+            a.sessions += b.sessions;
+            a.purch += b.purch;
+            a.rev += b.rev;
+            a.assist += b.assist;
         }
     }
-    fn flush_session(&mut self, person: u64) {
+    fn flush_session(&mut self) {
         let day = self.cur.start / D24;
         self.sessions.push((self.cur.start, day, self.cur.rev));
-        let ud = self.ud.entry((person, day)).or_default();
-        ud.sessions += 1;
-        ud.events += self.cur.n;
-        ud.rev += self.cur.rev;
-        for (c, v) in self.cur.cats.drain() {
-            *ud.cats.entry(c).or_insert(0) += v;
+        let di = (day - self.day_lo) as usize;
+        if !self.cells[di].used {
+            self.cells[di].used = true;
+            self.touched.push(di as u32);
         }
+        let c = &mut self.cells[di];
+        c.sessions += 1;
+        c.events += self.cur.n;
+        c.rev += self.cur.rev;
         self.cur.n = 0;
         self.cur.rev = 0;
     }
-}
-
-#[inline]
-fn cdkey(camp: u32, day: i64) -> u64 {
-    ((camp as u64) << 32) | (day as u64 & 0xffff_ffff)
 }
 
 fn person_runs<T: Sync>(arr: &[T], key: impl Fn(&T) -> u64 + Sync) -> Vec<(u64, u32, u32)> {
@@ -1494,14 +1488,14 @@ fn main() {
     let mut cl_runs = person_runs(&clicks, |c| c.person);
     cl_runs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
+    let day_lo = ws / D24;
+    let n_days = ((we - 1) / D24 - day_lo + 1) as usize;
+    let nslots = n_camps as usize + 1;
+    let cat_tab_ref = &cat_tab;
     let total = ev_runs
         .par_iter()
         .fold(
-            || {
-                let mut a = Acc::default();
-                a.alive = Alive::new(n_camps);
-                a
-            },
+            || Acc::new(n_days, n_camps, day_lo),
             |mut acc, &(person, lo, hi)| {
                 acc.sessions.clear();
                 acc.ats.clear();
@@ -1525,7 +1519,7 @@ fn main() {
                 let mut prev_ts = T_INVALID;
                 for e in &evs[lo as usize..hi as usize] {
                     if have && e.ts - prev_ts > MIN30 {
-                        acc.flush_session(person);
+                        acc.flush_session();
                         acc.cur.start = e.ts;
                     }
                     if !have {
@@ -1535,12 +1529,17 @@ fn main() {
                     acc.cur.n += 1;
                     if e.price > 0 {
                         acc.cur.rev += e.price as i64;
-                        *acc.cur.cats.entry(e.cat).or_insert(0) += e.price as i64;
+                        let di = (acc.cur.start / D24 - acc.day_lo) as usize;
+                        let cell = &mut acc.cells[di];
+                        match cell.cats.iter_mut().find(|x| x.0 == e.cat) {
+                            Some(x) => x.1 += e.price as i64,
+                            None => cell.cats.push((e.cat, e.price as i64)),
+                        }
                     }
                     prev_ts = e.ts;
                 }
                 if have {
-                    acc.flush_session(person);
+                    acc.flush_session();
                 }
                 for &(start, day, rev) in acc.sessions.iter() {
                     while hi_p < acc.ats.len() && acc.ats[hi_p] <= start {
@@ -1557,7 +1556,8 @@ fn main() {
                     } else {
                         organic_camp
                     };
-                    let e = acc.cd.entry(cdkey(ck, day)).or_default();
+                    let base = (day - day_lo) as usize * nslots;
+                    let e = &mut acc.cd[base + ck as usize];
                     e.sessions += 1;
                     e.rev += rev;
                     if rev > 0 {
@@ -1565,9 +1565,35 @@ fn main() {
                     }
                     for i2 in 0..acc.alive.elems.len() {
                         let c = acc.alive.elems[i2];
-                        acc.cd.entry(cdkey(c, day)).or_default().assist += 1;
+                        acc.cd[base + c as usize].assist += 1;
                     }
                 }
+                for &di in acc.touched.iter() {
+                    let c = &mut acc.cells[di as usize];
+                    let top = c
+                        .cats
+                        .iter()
+                        .max_by(|a, b| {
+                            a.1.cmp(&b.1).then_with(|| {
+                                cat_tab_ref[b.0 as usize].cmp(&cat_tab_ref[a.0 as usize])
+                            })
+                        })
+                        .map(|x| x.0);
+                    acc.ud_out.push((
+                        person,
+                        acc.day_lo + di as i64,
+                        c.sessions,
+                        c.events,
+                        c.rev,
+                        top,
+                    ));
+                    c.sessions = 0;
+                    c.events = 0;
+                    c.rev = 0;
+                    c.cats.clear();
+                    c.used = false;
+                }
+                acc.touched.clear();
                 acc
             },
         )
@@ -1578,29 +1604,22 @@ fn main() {
     pt!("sessionize");
 
     // ---------------- outputs ----------------
-    let mut ud_rows: Vec<(u64, i64, u64, u64, i64, Option<u32>)> =
-        Vec::with_capacity(total.ud.len());
-    for (&(person, day), a) in &total.ud {
-        let top = if a.cats.is_empty() {
-            None
-        } else {
-            a.cats
-                .iter()
-                .max_by(|(c1, r1), (c2, r2)| {
-                    r1.cmp(r2)
-                        .then_with(|| cat_tab[**c2 as usize].cmp(&cat_tab[**c1 as usize]))
-                })
-                .map(|(c, _)| *c)
-        };
-        ud_rows.push((person, day, a.sessions, a.events, a.rev, top));
-    }
+    let mut ud_rows = total.ud_out;
     ud_rows.sort_by(|a, b| key_cmp(a.0, b.0).then(a.1.cmp(&b.1)));
 
     let mut cd_rows: Vec<(u32, i64, u64, u64, i64, u64)> = Vec::new();
-    for (k, a) in &total.cd {
-        let camp = (k >> 32) as u32;
-        let day = (k & 0xffff_ffff) as u32 as i64;
-        cd_rows.push((camp, day, a.sessions, a.purch, a.rev, a.assist));
+    for (i, a) in total.cd.iter().enumerate() {
+        if a.sessions == 0 && a.assist == 0 {
+            continue;
+        }
+        cd_rows.push((
+            (i % nslots) as u32,
+            day_lo + (i / nslots) as i64,
+            a.sessions,
+            a.purch,
+            a.rev,
+            a.assist,
+        ));
     }
     let cn = |c: u32| -> &[u8] {
         if c == organic_camp {
