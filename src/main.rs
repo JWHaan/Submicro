@@ -1143,7 +1143,7 @@ fn main() {
         // dense ids for UF via open map
         let mut idmap: FxHashMap<u64, u32> = FxHashMap::default();
         let mut keys: Vec<u64> = Vec::new();
-        let mut idx_of = |k: u64, idmap: &mut FxHashMap<u64, u32>, keys: &mut Vec<u64>| -> u32 {
+        let idx_of = |k: u64, idmap: &mut FxHashMap<u64, u32>, keys: &mut Vec<u64>| -> u32 {
             if let Some(&i) = idmap.get(&k) {
                 return i;
             }
@@ -1859,44 +1859,51 @@ fn main() {
         );
     }
     pt!("write");
-    parallel_teardown();
+    if std::env::var_os("NO_TEARDOWN").is_none() {
+        let mut regions: Vec<(usize, usize)> = Vec::new();
+        reg_buf(&mut regions, &evs);
+        reg_buf(&mut regions, &clicks);
+        reg_buf(&mut regions, &total.ud_out);
+        reg_buf(&mut regions, &total.cd);
+        reg_buf(&mut regions, &ud_rows);
+        reg_buf(&mut regions, &cd_rows);
+        reg_buf(&mut regions, &ud_groups);
+        parallel_teardown(&regions);
+    }
     std::process::exit(0);
 }
 
-/// Free every large mapping across all threads so the kernel's serial VMA
-/// teardown at exit has no pages left to zap. Linux only; no-op elsewhere.
-#[cfg(target_os = "linux")]
-fn parallel_teardown() {
-    let Ok(maps) = fs::read_to_string("/proc/self/maps") else {
-        return;
-    };
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for line in maps.lines() {
-        let Some(dash) = line.find('-') else { continue };
-        let Ok(s) = usize::from_str_radix(&line[..dash], 16) else {
-            continue;
-        };
-        let rest = &line[dash + 1..];
-        let Some(sp) = rest.find(' ') else { continue };
-        let Ok(e) = usize::from_str_radix(&rest[..sp], 16) else {
-            continue;
-        };
-        if e.saturating_sub(s) >= (64 << 20) {
-            ranges.push((s, e));
+fn reg_buf<T>(out: &mut Vec<(usize, usize)>, v: &Vec<T>) {
+    let n = v.capacity().saturating_mul(std::mem::size_of::<T>());
+    if n >= (1 << 20) {
+        out.push((v.as_ptr() as usize, n));
+    }
+}
+
+/// Discard interior pages of our own dead buffers across all threads so the
+/// kernel's serial VMA teardown at exit has nothing left to zap. Only pages
+/// fully inside each buffer are touched: malloc chunk headers/footers and
+/// neighboring allocations stay intact. Set NO_TEARDOWN to skip.
+#[cfg(unix)]
+fn parallel_teardown(regions: &[(usize, usize)]) {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for &(s, n) in regions {
+        let s0 = (s + 4095) & !4095usize;
+        let e0 = (s + n) & !4095usize;
+        let mut p = s0;
+        while p < e0 {
+            let q = std::cmp::min(p + (64 << 20), e0);
+            spans.push((p, q));
+            p = q;
         }
     }
-    ranges.par_iter().for_each(|&(s, e)| unsafe {
-        let mut p = s;
-        while p < e {
-            let n = std::cmp::min(e - p, 32 << 20);
-            libc::madvise(p as *mut _, n, libc::MADV_DONTNEED);
-            p += n;
-        }
+    spans.par_iter().for_each(|&(s, e)| unsafe {
+        libc::madvise(s as *mut _, e - s, libc::MADV_DONTNEED);
     });
 }
 
-#[cfg(not(target_os = "linux"))]
-fn parallel_teardown() {}
+#[cfg(not(unix))]
+fn parallel_teardown(_regions: &[(usize, usize)]) {}
 
 fn str_of(b: &[u8]) -> &str {
     unsafe { std::str::from_utf8_unchecked(b) }

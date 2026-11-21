@@ -48,3 +48,14 @@ numbers rank builds only. Authoritative: bench.yml x86 A/B + track score.
 - Gate: fixtures 36/36, dev parity OK, diff 5/5, adversarial OK.
 - x86 A/B vs e3b1f71: queued.
 - Verdict: pending CI.
+
+## parallel teardown v1 — FAILED on x86 (segfault), reverted design
+- e3b1f71 scanned /proc/self/maps and MADV_DONTNEED'd every VMA ≥64MiB across threads before exit(0). Included the glibc heap arena + thread stacks → head zeroed its own allocator metadata → SIGSEGV.
+- x86 CI run 44897173563: base run1 3541ms then head crashed, exit 139. Run 44897501276 (5b37ae0 inheriting it): also exit 139. Both runs invalid.
+- Local gate was inert: #[cfg(linux)] never compiled the path on the ARM Mac — lesson: Linux-only perf code must be exercised in CI or cfg'd so local tests actually run it.
+
+## parallel teardown v2 — buffer-scoped, cross-platform
+- Change: register only interior pages of known app-owned buffers ≥1MiB (evs, clicks, ud_out, cd, ud_rows, cd_rows, ud_groups); round to page-aligned interior so malloc headers/footers and neighbor allocs are never touched; par_iter madvise; NO_TEARDOWN env opt-out; #[cfg(unix)] so macOS gate exercises it for real.
+- Gate: fixtures 36/36, dev parity OK, diff 5/5, adversarial OK; clean exit rc=0 on every local run (madvise path actually executed on macOS).
+- x86 A/B vs 68abd99 (last verified-good, pre-teardown): pending — measures teardown v2 + event-balanced chunks combined.
+- Verdict: pending CI.
