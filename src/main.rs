@@ -1,6 +1,6 @@
 // Shopping Sessions — v2 pipeline.
-// Same semantics as the verified v1; packed u64 keys, streaming tokenizer,
-// 16-24B records, open-addressing dedup, dense per-person runs.
+// Inline u128 byte keys, streaming tokenizer, open-addressing dedup,
+// dense per-person runs.
 use std::cell::Cell;
 use std::cmp::{max, min};
 use std::env;
@@ -10,6 +10,9 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
+
+#[cfg(test)]
+mod key_tests;
 
 use memchr::{memchr, memchr3, memmem};
 use memmap2::Mmap;
@@ -30,7 +33,11 @@ const D24: i64 = 86_400_000;
 const D7: i64 = 604_800_000;
 const T_INVALID: i64 = i64::MIN;
 const ORGANIC: &[u8] = b"organic";
-const FB_TAG: u64 = 0xF << 60; // fallback key tag (top nibble); packed keys stay below
+type Key = u128;
+const INLINE_MAX: usize = 15;
+const FB_TAG: u8 = 0xff;
+// Never a real key (length tag 16); only used to validate views/carts.
+const PRESENT_PRODUCT: Key = 16;
 
 static FILES: OnceLock<Vec<&'static [u8]>> = OnceLock::new();
 thread_local! {
@@ -43,107 +50,50 @@ fn buf(f: u16) -> &'static [u8] {
 }
 
 // ---------------------------------------------------------------------------
-// Packed keys: [0-9A-Za-z_] x <=10 chars -> u64, 6 bits/char, left-aligned.
-// Byte order is preserved among packed keys. key==0 is the empty sentinel.
-// Longer/other ids -> fallback interner, key = FB_TAG | (local*64 + shard).
+// Inline keys (big-endian): 15 leading, zero-padded bytes; low byte = length.
+// Numeric order is byte order: when only zero padding differs from the longer
+// value's suffix, length breaks the tie. 0 denotes exactly the empty string.
+// Long keys have tag 0xff in the *low* byte, disjoint even from 15 x 0xff.
 // ---------------------------------------------------------------------------
 #[inline]
-const fn build_pack_tab() -> [u8; 256] {
-    let mut t = [0xFFu8; 256];
-    let mut i = 0;
-    while i < 10 {
-        t[b'0' as usize + i] = i as u8 + 1;
-        i += 1;
-    }
-    let mut i = 0;
-    while i < 26 {
-        t[b'A' as usize + i] = i as u8 + 11;
-        i += 1;
-    }
-    t[b'_' as usize] = 37;
-    let mut i = 0;
-    while i < 26 {
-        t[b'a' as usize + i] = i as u8 + 38;
-        i += 1;
-    }
-    t
-}
-static PACK_TAB: [u8; 256] = build_pack_tab();
-
-#[inline(always)]
-fn packable(s: &[u8]) -> u64 {
-    if s.is_empty() || s.len() > 10 {
-        return u64::MAX; // signal: not packable
-    }
-    let mut k = 0u64;
-    for &c in s {
-        let v = PACK_TAB[c as usize];
-        if v == 0xFF {
-            return u64::MAX;
-        }
-        k = (k << 6) | v as u64;
-    }
-    // Left-align in 60 bits: pad with zero digits so integer order == byte order.
-    k << (6 * (10 - s.len()))
-}
-
-/// Unpack a packed key back into `out` (<=10 bytes); returns the length.
-#[inline]
-fn unpack(k: u64, out: &mut [u8; 10]) -> usize {
-    let mut n = 0usize;
-    for i in 0..10 {
-        let v = ((k >> (6 * (9 - i))) & 63) as u8;
-        if v == 0 {
-            break;
-        }
-        out[i] = match v {
-            1..=10 => b'0' + v - 1,
-            11..=36 => b'A' + v - 11,
-            37 => b'_',
-            _ => b'a' + v - 38,
-        };
-        n += 1;
-    }
-    n
+fn key_hash(k: Key) -> u64 {
+    // Fx byte hashing mixes both halves, including payload, length and tag.
+    // This value selects slots/shards only; equality always uses the full Key.
+    fxh(&k.to_le_bytes())
 }
 
 #[inline]
-fn fx64(k: u64) -> u64 {
-    let h = k.wrapping_mul(0x9E3779B97F4A7C15);
-    h ^ (h >> 33)
-}
-
 fn fxh(s: &[u8]) -> u64 {
     let mut h = FxHasher::default();
     h.write(s);
     h.finish()
 }
 
-/// Flat open-addressing u64->u64 map (key 0 = empty). One cache line per probe.
-struct U64Map {
-    keys: Vec<u64>,
-    vals: Vec<u64>,
+/// Flat open-addressing exact-key map (key 0 = empty).
+struct KeyMap<V> {
+    keys: Vec<Key>,
+    vals: Vec<V>,
     mask: usize,
     len: usize,
 }
-impl U64Map {
+impl<V: Copy + Default> KeyMap<V> {
     fn new(min_cap: usize) -> Self {
         let cap = (min_cap.max(16) * 2).next_power_of_two();
-        U64Map {
+        Self {
             keys: vec![0; cap],
-            vals: vec![0; cap],
+            vals: vec![V::default(); cap],
             mask: cap - 1,
             len: 0,
         }
     }
     fn grow(&mut self) {
         let ncap = self.keys.len() * 2;
-        let (mut nk, mut nv) = (vec![0u64; ncap], vec![0u64; ncap]);
+        let (mut nk, mut nv) = (vec![0; ncap], vec![V::default(); ncap]);
         let nmask = ncap - 1;
         for i in 0..self.keys.len() {
             let k = self.keys[i];
             if k != 0 {
-                let mut s = (fx64(k) as usize) & nmask;
+                let mut s = (key_hash(k) as usize) & nmask;
                 while nk[s] != 0 {
                     s = (s + 1) & nmask;
                 }
@@ -156,8 +106,9 @@ impl U64Map {
         self.mask = nmask;
     }
     #[inline]
-    fn insert(&mut self, k: u64, v: u64) {
-        let mut s = (fx64(k) as usize) & self.mask;
+    fn insert(&mut self, k: Key, v: V) {
+        debug_assert_ne!(k, 0);
+        let mut s = (key_hash(k) as usize) & self.mask;
         loop {
             if self.keys[s] == 0 {
                 self.keys[s] = k;
@@ -176,8 +127,8 @@ impl U64Map {
         }
     }
     #[inline]
-    fn get(&self, k: u64) -> Option<u64> {
-        let mut s = (fx64(k) as usize) & self.mask;
+    fn get(&self, k: Key) -> Option<V> {
+        let mut s = (key_hash(k) as usize) & self.mask;
         loop {
             let kk = unsafe { *self.keys.get_unchecked(s) };
             if kk == 0 {
@@ -193,14 +144,13 @@ impl U64Map {
 
 // Fallback interner: 64 shards, id = local*64 + shard (mirrors key tag layout).
 struct FbShard {
-    map: FxHashMap<Box<[u8]>, u32>,
+    map: FxHashMap<Box<[u8]>, usize>,
     tab: Vec<Box<[u8]>>,
 }
 struct Fb {
     shards: Vec<RwLock<FbShard>>,
 }
 const ISHARD: usize = 64;
-const ISHARD_MASK: u64 = (ISHARD - 1) as u64;
 impl Fb {
     fn new() -> Self {
         Fb {
@@ -215,31 +165,34 @@ impl Fb {
         }
     }
     #[inline]
-    fn intern(&self, s: &[u8]) -> u64 {
+    fn intern(&self, s: &[u8]) -> Key {
         let i = (fxh(s) as usize) & (ISHARD - 1);
+        let encode = |v: usize| (((v as Key) * ISHARD as Key + i as Key) << 8) | FB_TAG as Key;
         {
             let sh = self.shards[i].read().unwrap();
             if let Some(&v) = sh.map.get(s) {
-                return FB_TAG | ((v as u64) << 6) | i as u64;
+                return encode(v);
             }
         }
         let mut sh = self.shards[i].write().unwrap();
         if let Some(&v) = sh.map.get(s) {
-            return FB_TAG | ((v as u64) << 6) | i as u64;
+            return encode(v);
         }
-        let v = sh.tab.len() as u64;
+        let v = sh.tab.len();
         let b: Box<[u8]> = s.into();
         sh.tab.push(b.clone());
-        sh.map.insert(b, v as u32);
-        FB_TAG | (v << 6) | i as u64
+        sh.map.insert(b, v);
+        encode(v)
     }
     /// Resolve a fallback key back to bytes (reads the live shard).
     #[inline]
-    fn get(&self, k: u64) -> &[u8] {
-        let sh = self.shards[(k & ISHARD_MASK) as usize].read().unwrap();
-        let ptr = sh.tab[(k >> 6) as usize & ((1 << 54) - 1)].as_ptr();
-        let len = sh.tab[(k >> 6) as usize & ((1 << 54) - 1)].len();
-        unsafe { std::slice::from_raw_parts(ptr, len) }
+    fn get(&self, k: Key) -> &[u8] {
+        let id = k >> 8;
+        let sh = self.shards[id as usize & (ISHARD - 1)].read().unwrap();
+        let bytes = &sh.tab[(id / ISHARD as Key) as usize];
+        // Entries are append-only: the vector may move Boxes, never their byte
+        // allocations. The returned borrow cannot outlive the owning interner.
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) }
     }
 }
 
@@ -247,26 +200,38 @@ static FB: OnceLock<Fb> = OnceLock::new();
 
 /// Pack or intern `s` into a key. len==0 -> 0.
 #[inline]
-fn key_of(s: &[u8]) -> u64 {
-    if s.is_empty() {
-        return 0;
-    }
-    let k = packable(s);
-    if k != u64::MAX {
-        return k;
-    }
-    FB.get().unwrap().intern(s)
+fn key_of(s: &[u8]) -> Key {
+    let n = s.len();
+    // Overlapping head/tail loads agree in the overlap. Both chunks are
+    // entirely inside this field, including at the very end of an mmap.
+    let data = match n {
+        9..=INLINE_MAX => {
+            let head = u64::from_be_bytes(*s.first_chunk().unwrap());
+            let tail = u64::from_be_bytes(*s.last_chunk().unwrap());
+            ((head as Key) << 64) | ((tail << (8 * (16 - n))) as Key)
+        }
+        4..=8 => {
+            let head = u32::from_be_bytes(*s.first_chunk().unwrap()) as u64;
+            let tail = u32::from_be_bytes(*s.last_chunk().unwrap()) as u64;
+            (((head << 32) | (tail << (8 * (8 - n)))) as Key) << 64
+        }
+        2..=3 => {
+            let tail = u16::from_be_bytes(*s.last_chunk().unwrap()) as Key;
+            ((s[0] as Key) << 120) | (tail << (8 * (16 - n)))
+        }
+        1 => (s[0] as Key) << 120,
+        0 => return 0,
+        _ => return FB.get().unwrap().intern(s),
+    };
+    data | n as Key
 }
 
 /// Key -> bytes. Uses `scratch` for packed keys.
 #[inline]
-fn key_bytes<'a>(k: u64, scratch: &'a mut [u8; 10]) -> &'a [u8] {
-    if k == 0 {
-        return &[];
-    }
-    if k < FB_TAG {
-        let n = unpack(k, scratch);
-        &scratch[..n]
+fn key_bytes(k: Key, scratch: &mut [u8; 16]) -> &[u8] {
+    if k as u8 != FB_TAG {
+        *scratch = k.to_be_bytes();
+        &scratch[..k as u8 as usize]
     } else {
         FB.get().unwrap().get(k)
     }
@@ -275,11 +240,11 @@ fn key_bytes<'a>(k: u64, scratch: &'a mut [u8; 10]) -> &'a [u8] {
 /// Byte-order compare of two keys (matches lexicographic comparison of the
 /// original ids). Hot path is packed-vs-packed = integer compare.
 #[inline]
-fn key_cmp(a: u64, b: u64) -> std::cmp::Ordering {
-    if a < FB_TAG && b < FB_TAG {
+fn key_cmp(a: Key, b: Key) -> std::cmp::Ordering {
+    if ((a | b) as u8) <= INLINE_MAX as u8 {
         return a.cmp(&b);
     }
-    let (mut sa, mut sb) = ([0u8; 10], [0u8; 10]);
+    let (mut sa, mut sb) = ([0; 16], [0; 16]);
     key_bytes(a, &mut sa).cmp(key_bytes(b, &mut sb))
 }
 
@@ -435,8 +400,8 @@ fn parse_ts(s: &[u8]) -> i64 {
 // ---------------------------------------------------------------------------
 #[derive(Clone, Copy)]
 struct FEv {
-    uid: u64,  // user_id key, 0 = empty
-    prod: u64, // product key, 0 = empty
+    uid: Key,  // user_id key, 0 = empty
+    prod: Key, // product key, 0 = empty
     ts: i64,
     price: u32,
     etype: u8, // 0 view,1 cart,2 purchase,3 bad
@@ -447,13 +412,13 @@ struct FEv {
 // Dedup scatter source: eid+ingest only. gidx is implicit (task base + index).
 #[derive(Clone, Copy)]
 struct DIn {
-    eid: u64,
+    eid: Key,
     ingest: i64,
 }
 
 #[derive(Clone, Copy)]
 struct Ev {
-    person: u64, // canonical person key
+    person: Key, // canonical person key
     ts: i64,
     cat: u32,
     price: u32,
@@ -462,8 +427,8 @@ struct Ev {
 
 #[derive(Clone, Copy)]
 struct RawCl {
-    cid: u64,
-    uid: u64,
+    cid: Key,
+    uid: Key,
     camp: u32, // campaign idx, u32::MAX = unknown
     ts: i64,
     _p: u32,
@@ -478,10 +443,10 @@ const RAWC_E: RawCl = RawCl {
 
 #[derive(Clone, Copy)]
 struct Cl {
-    person: u64,
+    person: Key,
     ts: i64,
     camp: u32,
-    cid: u64, // key; byte order needed only for equal-ts ties
+    cid: Key, // key; byte order needed only for equal-ts ties
     _p: u32,
 }
 const CL_E: Cl = Cl {
@@ -496,13 +461,13 @@ const CL_E: Cl = Cl {
 /// concatenate. Equal keys stay contiguous; global key order is NOT produced.
 fn shard_sort<T: Copy + Send + Sync, const NSHARD: usize>(
     v: Vec<T>,
-    key: impl Fn(&T) -> u64 + Sync,
+    key: impl Fn(&T) -> Key + Sync,
     fill: T,
     cmp: impl Fn(&T, &T) -> std::cmp::Ordering + Sync,
 ) -> Vec<T> {
     let mut cnt = vec![0u32; NSHARD + 1].into_boxed_slice();
     for e in &v {
-        cnt[((fx64(key(e)) as usize) & (NSHARD - 1)) + 1] += 1;
+        cnt[((key_hash(key(e)) as usize) & (NSHARD - 1)) + 1] += 1;
     }
     for i in 0..NSHARD {
         cnt[i + 1] += cnt[i];
@@ -510,7 +475,7 @@ fn shard_sort<T: Copy + Send + Sync, const NSHARD: usize>(
     let mut out = vec![fill; v.len()];
     let mut pos = cnt.clone();
     for e in v {
-        let s = (fx64(key(&e)) as usize) & (NSHARD - 1);
+        let s = (key_hash(key(&e)) as usize) & (NSHARD - 1);
         out[pos[s] as usize] = e;
         pos[s] += 1;
     }
@@ -867,8 +832,8 @@ impl Alive {
 
 #[derive(Default)]
 struct Acc {
-    ud_out: Vec<(u64, i64, u64, u64, i64, Option<u32>)>,
-    ud_groups: Vec<(u64, u32, u32)>,
+    ud_out: Vec<UdRow>,
+    ud_groups: Vec<(Key, u32, u32)>,
     cd: Vec<CdAcc>,
     cells: Vec<UdCell>,
     touched: Vec<u32>,
@@ -923,14 +888,14 @@ impl Acc {
     }
 }
 
-fn person_runs<T: Sync>(arr: &[T], key: impl Fn(&T) -> u64 + Sync) -> Vec<(u64, u32, u32)> {
+fn person_runs<T: Sync>(arr: &[T], key: impl Fn(&T) -> Key + Sync) -> Vec<(Key, u32, u32)> {
     let n = arr.len();
     if n == 0 {
         return Vec::new();
     }
     let nblk = (rayon::current_num_threads() * 4).max(1);
     let blksz = n.div_ceil(nblk).max(1);
-    let parts: Vec<Vec<(u64, u32, u32)>> = (0..nblk)
+    let parts: Vec<Vec<(Key, u32, u32)>> = (0..nblk)
         .into_par_iter()
         .map(|b| {
             let lo = b * blksz;
@@ -952,7 +917,7 @@ fn person_runs<T: Sync>(arr: &[T], key: impl Fn(&T) -> u64 + Sync) -> Vec<(u64, 
             v
         })
         .collect();
-    let mut out: Vec<(u64, u32, u32)> = Vec::new();
+    let mut out: Vec<(Key, u32, u32)> = Vec::new();
     for blk in parts {
         for (p, l, h) in blk {
             if let Some(last) = out.last_mut() {
@@ -970,18 +935,18 @@ fn person_runs<T: Sync>(arr: &[T], key: impl Fn(&T) -> u64 + Sync) -> Vec<(u64, 
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct DRec {
-    eid: u64,
+    eid: Key,
     ingest: i64,
     gidx: u32,
 }
 
-// Open-addressing u64 key table over a dedup-record slice; keeps the row
+// Open-addressing exact-key table over a dedup-record slice; keeps the row
 // index with min `ingest` (first wins ties). Returns surviving indices.
 fn dedup_min_d(rows: &[DRec]) -> Vec<u32> {
     let slots = (rows.len().max(16) * 4).next_power_of_two();
     let mut cnt = vec![0u64; slots / 32];
     for r in rows {
-        let s = (fx64(r.eid) as usize) & (slots - 1);
+        let s = (key_hash(r.eid) as usize) & (slots - 1);
         let w = s >> 5;
         let sh = (s & 31) * 2;
         if (cnt[w] >> sh) & 3 < 2 {
@@ -991,7 +956,7 @@ fn dedup_min_d(rows: &[DRec]) -> Vec<u32> {
     let mut out = Vec::with_capacity(rows.len());
     let mut dup_rows: Vec<u32> = Vec::new();
     for (i, r) in rows.iter().enumerate() {
-        let s = (fx64(r.eid) as usize) & (slots - 1);
+        let s = (key_hash(r.eid) as usize) & (slots - 1);
         if (cnt[s >> 5] >> ((s & 31) * 2)) & 3 >= 2 {
             dup_rows.push(i as u32);
         } else {
@@ -1002,11 +967,11 @@ fn dedup_min_d(rows: &[DRec]) -> Vec<u32> {
         return out;
     }
     let cap = (dup_rows.len().max(16) * 2).next_power_of_two();
-    let mut keys = vec![0u64; cap];
+    let mut keys = vec![0; cap];
     let mut vals = vec![u32::MAX; cap];
     for &i in &dup_rows {
         let r = &rows[i as usize];
-        let mut s = (fx64(r.eid) as usize) & (cap - 1);
+        let mut s = (key_hash(r.eid) as usize) & (cap - 1);
         loop {
             if keys[s] == 0 {
                 keys[s] = r.eid;
@@ -1110,7 +1075,7 @@ fn main() {
         i
     };
     let unknown_cat = intern_cat(b"unknown");
-    let mut prod_map = U64Map::new(4096);
+    let mut prod_map = KeyMap::new(4096);
     {
         let b = buf(prod_f);
         each_line(b, 0, b.len(), true, 2, |fields, b| {
@@ -1126,7 +1091,7 @@ fn main() {
     // campaigns.csv -> camp key -> idx
     let mut camp_names: Vec<Box<[u8]>> = Vec::new();
     let mut camp_chan: Vec<Box<[u8]>> = Vec::new();
-    let mut camp_map = U64Map::new(4096);
+    let mut camp_map = KeyMap::new(4096);
     {
         let b = buf(camp_f);
         each_line(b, 0, b.len(), true, 2, |fields, b| {
@@ -1150,7 +1115,7 @@ fn main() {
     let organic_camp = n_camps;
     pt!("catalogs");
 
-    // links -> union-find over u64 keys -> canon map
+    // links -> union-find over exact keys -> canon map
     let canon_map = {
         let link_tasks: Vec<(u16, usize, usize)> = (ncl..nln)
             .flat_map(|fi| {
@@ -1159,7 +1124,7 @@ fn main() {
                     .map(move |(cs, ce)| (fi as u16, cs, ce))
             })
             .collect();
-        let pairs: Vec<(u64, u64)> = link_tasks
+        let pairs: Vec<(Key, Key)> = link_tasks
             .par_iter()
             .flat_map(|&(f, cs, ce)| {
                 let b = buf(f);
@@ -1178,9 +1143,9 @@ fn main() {
             })
             .collect();
         // dense ids for UF via open map
-        let mut idmap: FxHashMap<u64, u32> = FxHashMap::default();
-        let mut keys: Vec<u64> = Vec::new();
-        let idx_of = |k: u64, idmap: &mut FxHashMap<u64, u32>, keys: &mut Vec<u64>| -> u32 {
+        let mut idmap: FxHashMap<Key, u32> = FxHashMap::default();
+        let mut keys: Vec<Key> = Vec::new();
+        let idx_of = |k: Key, idmap: &mut FxHashMap<Key, u32>, keys: &mut Vec<Key>| -> u32 {
             if let Some(&i) = idmap.get(&k) {
                 return i;
             }
@@ -1209,21 +1174,21 @@ fn main() {
                 *e = i;
             }
         }
-        let mut m = U64Map::new(n_ids);
+        let mut m = KeyMap::new(n_ids);
         let bmask = (n_ids * 8).max(1 << 16).next_power_of_two() - 1;
         let mut bloom = vec![0u64; (bmask + 1) / 64];
         for i in 0..n_ids as u32 {
             let k = keys[i as usize];
             let canon = keys[comp_min[&uf.find(i)] as usize];
             m.insert(k, canon);
-            let bi = (fx64(k) as usize) & bmask;
+            let bi = (key_hash(k) as usize) & bmask;
             bloom[bi >> 6] |= 1 << (bi & 63);
         }
         (m, bloom, bmask)
     };
     let (canon_map, cbloom, cbmask) = canon_map;
-    let canon_of = |k: u64| -> u64 {
-        let h = fx64(k) as usize;
+    let canon_of = |k: Key| -> Key {
+        let h = key_hash(k) as usize;
         if cbloom[(h & cbmask) >> 6] >> (h & 63) & 1 == 0 {
             return k;
         }
@@ -1245,7 +1210,7 @@ fn main() {
             tasks.push(Task { file: fi, cs, ce });
         }
     }
-    let shard_of = |eid: u64| (fx64(eid) as usize) & (NSHARD - 1);
+    let shard_of = |eid: Key| (key_hash(eid) as usize) & (NSHARD - 1);
     let parsed: Vec<(Vec<FEv>, Vec<DIn>, Vec<u32>)> = tasks
         .par_iter()
         .map(|t| {
@@ -1308,13 +1273,13 @@ fn main() {
                     }
                 };
                 // product key only needed for purchases; other types just
-                // need "non-empty" (sentinel 1 — key_of never returns 1)
+                // need "non-empty" (not used for catalog lookups).
                 let prod_key = if prod.is_empty() {
                     0
                 } else if etype == 2 {
                     key_of(prod)
                 } else {
-                    1
+                    PRESENT_PRODUCT
                 };
                 let ek = key_of(eid);
                 cnt[shard_of(ek)] += 1;
@@ -1419,7 +1384,7 @@ fn main() {
 
     let prod_map_ref = &prod_map;
     let kept_ref = &kept;
-    let pshard_of = |person: u64| (fx64(person) as usize) & (NSHARD - 1);
+    let pshard_of = |person: Key| (key_hash(person) as usize) & (NSHARD - 1);
     let ev_parts: Vec<(Vec<Ev>, Vec<u32>)> = (0..nt)
         .into_par_iter()
         .map(|t| {
@@ -1568,7 +1533,7 @@ fn main() {
             .map(|v| {
                 let mut c = vec![0u32; NSHARD];
                 for r in v {
-                    c[(fx64(r.cid) as usize) & (NSHARD - 1)] += 1;
+                    c[(key_hash(r.cid) as usize) & (NSHARD - 1)] += 1;
                 }
                 let mut offs = Vec::with_capacity(NSHARD + 1);
                 let mut acc = 0u32;
@@ -1580,7 +1545,7 @@ fn main() {
                 let mut pos = offs.clone();
                 let mut flat = vec![RAWC_E; v.len()];
                 for r in v {
-                    let s = (fx64(r.cid) as usize) & (NSHARD - 1);
+                    let s = (key_hash(r.cid) as usize) & (NSHARD - 1);
                     flat[pos[s] as usize] = *r;
                     pos[s] += 1;
                 }
@@ -1607,10 +1572,10 @@ fn main() {
         .flat_map(|rows| {
             // first-copy-wins dedup on cid
             let cap = (rows.len().max(16) * 2).next_power_of_two();
-            let mut keys = vec![0u64; cap];
+            let mut keys = vec![0; cap];
             let mut out = Vec::with_capacity(rows.len());
             for r in &rows {
-                let mut s = (fx64(r.cid) as usize) & (cap - 1);
+                let mut s = (key_hash(r.cid) as usize) & (cap - 1);
                 loop {
                     if keys[s] == 0 {
                         keys[s] = r.cid;
@@ -1651,18 +1616,19 @@ fn main() {
     // ---------------- sessionize + attribute ----------------
     let ev_runs = person_runs(&evs, |e| e.person);
     let cl_runs = person_runs(&clicks, |c| c.person);
-    // both arenas are grouped by fx64(person)&255 shards; per-shard merge join
-    // maps each event-run to its click-run without any binary search
+    // Both arenas use the same person hash and numeric within-shard order
+    // (including fallback handles); only contiguity/equality is needed here.
+    // The merge join maps each event-run to its click-run without binary search.
     let mut ev_bounds = [0u32; NSHARD + 1];
     for r in &ev_runs {
-        ev_bounds[((fx64(r.0) as usize) & (NSHARD - 1)) + 1] += 1;
+        ev_bounds[((key_hash(r.0) as usize) & (NSHARD - 1)) + 1] += 1;
     }
     for i in 0..NSHARD {
         ev_bounds[i + 1] += ev_bounds[i];
     }
     let mut cl_bounds = [0u32; NSHARD + 1];
     for r in &cl_runs {
-        cl_bounds[((fx64(r.0) as usize) & (NSHARD - 1)) + 1] += 1;
+        cl_bounds[((key_hash(r.0) as usize) & (NSHARD - 1)) + 1] += 1;
     }
     for i in 0..NSHARD {
         cl_bounds[i + 1] += cl_bounds[i];
@@ -1821,7 +1787,7 @@ fn main() {
     for &(_, _, l) in &ud_groups {
         goff.push(goff.last().unwrap() + l);
     }
-    let ud_rows: Vec<(u64, i64, u64, u64, i64, Option<u32>)> = if write_csv {
+    let ud_rows: Vec<UdRow> = if write_csv {
         let mut ud_rows = Vec::with_capacity(total.ud_out.len());
         for &(_, s, l) in &ud_groups {
             ud_rows.extend_from_slice(&total.ud_out[s as usize..(s + l) as usize]);
@@ -1926,16 +1892,16 @@ fn str_of(b: &[u8]) -> &str {
 }
 
 /// person key -> display bytes (scratch for packed keys)
-fn person_bytes<'a>(k: u64, s: &'a mut [u8; 10]) -> &'a [u8] {
+fn person_bytes(k: Key, s: &mut [u8; 16]) -> &[u8] {
     key_bytes(k, s)
 }
 
-type UdRow = (u64, i64, u64, u64, i64, Option<u32>);
+type UdRow = (Key, i64, u64, u64, i64, Option<u32>);
 
 fn write_user_parquet(
     dir: &Path,
     ud_out: &[UdRow],
-    groups: &[(u64, u32, u32)],
+    groups: &[(Key, u32, u32)],
     goff: &[u32],
     cat_tab: &[Box<[u8]>],
 ) {
@@ -1956,7 +1922,7 @@ fn write_user_part(
     dir: &Path,
     part: usize,
     ud_out: &[UdRow],
-    groups: &[(u64, u32, u32)],
+    groups: &[(Key, u32, u32)],
     goff: &[u32],
     lo: usize,
     hi: usize,
@@ -1998,7 +1964,7 @@ fn write_user_part(
         while a < b {
             let take = (b - a).min(CHUNK - cur);
             for r in &ud_out[s as usize + a..s as usize + a + take] {
-                let mut sc = [0u8; 10];
+                let mut sc = [0u8; 16];
                 vals.extend_from_slice(person_bytes(r.0, &mut sc));
                 offs.push(vals.len() as i32);
                 day.push(r.1 as i32);
@@ -2143,7 +2109,7 @@ fn write_camp_part(
 
 fn write_csvs(
     outdir: &Path,
-    ud_rows: &[(u64, i64, u64, u64, i64, Option<u32>)],
+    ud_rows: &[UdRow],
     cd_rows: &[(u32, i64, u64, u64, i64, u64)],
     camp_names: &[Box<[u8]>],
     camp_chan: &[Box<[u8]>],
@@ -2159,7 +2125,7 @@ fn write_csvs(
         .unwrap();
     for r in ud_rows {
         let top = r.5.map(|c| str_of(&cat_tab[c as usize])).unwrap_or("");
-        let mut s = [0u8; 10];
+        let mut s = [0u8; 16];
         writeln!(
             f,
             "{},{},{},{},{},{}",

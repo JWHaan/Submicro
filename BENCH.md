@@ -121,3 +121,28 @@ numbers rank builds only. Authoritative: bench.yml x86 A/B + track score.
 - output_rows still ~470-700ms depending on CPU: remaining fat is Arrow
   RecordBatch materialization + parquet-rs encode pipeline => hand-rolled
   writer is still the lever there.
+
+## WS-D: inline raw-byte u128 keys — isolated candidate, not a keep decision
+- Base `73dd70392be4752322e88b7d2c3e63fa37e1cd48`. Inline lengths 0–15;
+  exact sharded interner for everything longer. No dense-ID or fingerprint
+  table change. No timing or 60M peak RSS measured for this entry.
+- Local arm64 release binary: 4/4 unit tests, including probe collisions,
+  prefix/NUL/space order across the inline boundary, and protected-page ends.
+  Both decoded Parquet tables and schemas passed 36/36 fixtures, public dev
+  (117,038 user / 27,400 campaign rows), 5 established diffs, 20 more official
+  generator seeds 81–100 (5k events + 1,250 clicks each vs Python), and a
+  combined long/NUL-ID, invalid-earliest-duplicate and attribution fixture.
+- Native `size_of`: FEv/DIn/DRec **48/32/32 B**, Ev 32 B, RawCl/Cl 48 B,
+  UdRow 64 B, person-run tuple 32 B; all align to 16 B. Live record payload
+  in the eid scatter = 112 B/parsed event vs 72 B at baseline, i.e. 6.72 vs
+  4.32 GB at 60M, excluding capacity, maps, scratch, other phases and input.
+- Public dev profile: every nonempty eid/cid/uid inspected in well-formed
+  event/click/link rows fit *both* representations (max 9 bytes); no reduction
+  in fallback count for these fields on that input. Do not extrapolate to
+  unseen data. Interleaved A/B and constrained amd64 60M time/RSS still needed.
+- Separate fp experiment: a `(tag, local_row_index)` slot can refer back to
+  the authoritative DRec eid for full equality and ingest comparison. Today's
+  shard choice and inside-shard home slots use the same low hash bits; test
+  disjoint bits *separately*. Dense catalog indices already exist; a new
+  dense person encoding would also have to preserve unused linked aliases and
+  reversible byte identity, including leading zeros. Neither is in this A/B.
