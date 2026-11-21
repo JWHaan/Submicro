@@ -1,6 +1,7 @@
 // Shopping Sessions — v2 pipeline.
 // Same semantics as the verified v1; packed u64 keys, streaming tokenizer,
 // 16-24B records, open-addressing dedup, dense per-person runs.
+use std::cell::Cell;
 use std::cmp::{max, min};
 use std::env;
 use std::fs;
@@ -331,6 +332,11 @@ fn swar_digits(w: u64) -> bool {
     (w & HI) == D3 && (w.wrapping_add(0x0606060606060606) & HI) == D3
 }
 
+thread_local! {
+    /// (s[0..8] as u64, s[8..10] as u16) -> day epoch ms. Last seen "YYYY-MM-DD".
+    static TS_CACHE: Cell<(u64, u16, i64)> = const { Cell::new((0, 0, T_INVALID)) };
+}
+
 /// Epoch ms, or T_INVALID on any violation. Same strictness as the reference.
 fn parse_ts(s: &[u8]) -> i64 {
     if s.is_empty() {
@@ -372,36 +378,56 @@ fn parse_ts(s: &[u8]) -> i64 {
     // SWAR digit check over the 14 digit positions; separator lanes are
     // masked to '0' (already verified above), byte 19 masked (checked as
     // 'Z'/'+''-' by the length test).
-    let w0 = u64::from_le_bytes(s[0..8].try_into().unwrap());
+    // Date-prefix cache: input spans few distinct days; a byte-identical
+    // "YYYY-MM-DD" prefix has already passed its digit/range checks, so a
+    // hit reuses the day->ms decode and skips the w0 SWAR check, the
+    // month/leap/day validation, and days_from_civil.
+    let k0 = u64::from_le_bytes(s[0..8].try_into().unwrap());
+    let k1 = u16::from_le_bytes(s[8..10].try_into().unwrap());
+    let day_ms = match TS_CACHE.with(|c| c.get()) {
+        (ck0, ck1, ms) if ck0 == k0 && ck1 == k1 => ms,
+        _ => {
+            let w0 = u64::from_le_bytes(s[0..8].try_into().unwrap());
+            if !swar_digits((w0 & 0x00FFFF00FFFFFFFF) | 0x3000003000000000) {
+                return T_INVALID;
+            }
+            let dg = |i: usize| (s[i] - b'0') as i64;
+            let y = dg(0) * 1000 + dg(1) * 100 + dg(2) * 10 + dg(3);
+            let mo = dg(5) * 10 + dg(6);
+            let d = dg(8) * 10 + dg(9);
+            if mo < 1 || mo > 12 {
+                return T_INVALID;
+            }
+            let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+            let mdays = [
+                31,
+                if leap { 29 } else { 28 },
+                31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+            ][(mo - 1) as usize];
+            if d < 1 || d > mdays {
+                return T_INVALID;
+            }
+            let ms = days_from_civil(y, mo, d) * 86400000;
+            TS_CACHE.with(|c| c.set((k0, k1, ms)));
+            ms
+        }
+    };
     let w1 = u64::from_le_bytes(s[8..16].try_into().unwrap());
     let x2 = (u32::from_le_bytes(s[16..20].try_into().unwrap()) & 0x00FFFF00) | 0x30000030;
-    if !swar_digits((w0 & 0x00FFFF00FFFFFFFF) | 0x3000003000000000)
-        || !swar_digits((w1 & 0xFFFF00FFFF00FFFF) | 0x0000300000300000)
+    if !swar_digits((w1 & 0xFFFF00FFFF00FFFF) | 0x0000300000300000)
         || (x2 & 0xF0F0F0F0 != 0x30303030)
         || (x2.wrapping_add(0x06060606) & 0xF0F0F0F0 != 0x30303030)
     {
         return T_INVALID;
     }
     let dg = |i: usize| (s[i] - b'0') as i64;
-    let y = dg(0) * 1000 + dg(1) * 100 + dg(2) * 10 + dg(3);
-    let mo = dg(5) * 10 + dg(6);
-    let d = dg(8) * 10 + dg(9);
     let h = dg(11) * 10 + dg(12);
     let mi = dg(14) * 10 + dg(15);
     let sec = dg(17) * 10 + dg(18);
-    if mo < 1 || mo > 12 || h > 23 || mi > 59 || sec > 59 {
+    if h > 23 || mi > 59 || sec > 59 {
         return T_INVALID;
     }
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let mdays = [
-        31,
-        if leap { 29 } else { 28 },
-        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
-    ][(mo - 1) as usize];
-    if d < 1 || d > mdays {
-        return T_INVALID;
-    }
-    ((days_from_civil(y, mo, d) * 24 + h) * 60 + mi) * 60000 + sec * 1000 - off_ms
+    day_ms + (h * 3600 + mi * 60 + sec) * 1000 - off_ms
 }
 
 // ---------------------------------------------------------------------------
