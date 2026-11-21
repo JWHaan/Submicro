@@ -41,14 +41,6 @@ numbers rank builds only. Authoritative: bench.yml x86 A/B + track score.
 | x86 CI A/B run 44895982268: 6e85aff (SWAR parse_ts) vs 4202d95 @20M synth9 NCPU=4 | base med ~3718ms → head med ~3684ms (~1% lean head, near-noise); CSV + all parquet parts identical | parse_ts kept (fewer instructions, no regression) |
 | x86 CI A/B run 44896494150: fb2f810 (fused user-parquet writer) vs 3dd79da @20M synth9 NCPU=4 | base 3269-3400ms (med ~3330) → head 3134-3349ms (med ~3187, ~4.3%); CSV + all parquet parts identical | fused writer confirmed on x86 |
 | packable charset lookup via const-built 256B PACK_TAB (match -> L1 load) + #[inline(always)] | local ev_parse min ~268ms (noisy); 36/36 fixtures + dev parity + 5/5 diff + adversarial all identical | committed 6db309e, CI run 44896828545 pending |
-
-## event-balanced sessionize chunks (uncommitted head vs e3b1f71)
-- Change: replace `par_iter().with_min_len(1<<16)` (run-count split → ~10 tasks at 667K runs, whale runs serialize on one thread) with ~96 chunks split on a cumulative-event prefix. Fold body byte-identical; chunk boundaries only between runs. Semantically free: one person = one run = one ud_groups entry; row order comes from the group sort downstream; cd merge commutes.
-- Local synth9-20M: sessionize 370–513ms (box noisy, uniform users hide the skew benefit).
-- Gate: fixtures 36/36, dev parity OK, diff 5/5, adversarial OK.
-- x86 A/B vs e3b1f71: queued.
-- Verdict: pending CI.
-
 ## parallel teardown v1 — FAILED on x86 (segfault), reverted design
 - e3b1f71 scanned /proc/self/maps and MADV_DONTNEED'd every VMA ≥64MiB across threads before exit(0). Included the glibc heap arena + thread stacks → head zeroed its own allocator metadata → SIGSEGV.
 - x86 CI run 44897173563: base run1 3541ms then head crashed, exit 139. Run 44897501276 (5b37ae0 inheriting it): also exit 139. Both runs invalid.
@@ -57,6 +49,9 @@ numbers rank builds only. Authoritative: bench.yml x86 A/B + track score.
 ## parallel teardown v2 — buffer-scoped, cross-platform
 - Change: register only interior pages of known app-owned buffers ≥1MiB (evs, clicks, ud_out, cd, ud_rows, cd_rows, ud_groups); round to page-aligned interior so malloc headers/footers and neighbor allocs are never touched; par_iter madvise; NO_TEARDOWN env opt-out; #[cfg(unix)] so macOS gate exercises it for real.
 - Gate: fixtures 36/36, dev parity OK, diff 5/5, adversarial OK; clean exit rc=0 on every local run (madvise path actually executed on macOS).
-- x86 A/B vs 68abd99 (last verified-good, pre-teardown): pending — measures teardown v2 + event-balanced chunks combined.
-- Verdict: pending CI.
+- x86 CI A/B run 44898107917: d629351 (teardown v2 + event-balanced chunks) vs 68abd99 @20M NCPU=4 | base 2931-3087ms (med ~2959) → head 3043-3148ms (med ~3080, ~4% SLOWER); outputs identical | combined change REGRESSED — reverted 5b37ae0 (balanced chunks) to isolate; teardown v2 retest pending |
 | x86 CI A/B run 44896828545: 6db309e (packable 256B LUT) vs fb2f810 @20M synth9 NCPU=4 | base 3579-4187ms (med ~3622) → head 3338-3453ms (med ~3381, ~6.7%); CSV + all parquet parts identical | packable LUT confirmed on x86 — KEEP |
+
+## event-balanced sessionize chunks — REVERTED (x86 regression)
+- 5b37ae0 replaced with_min_len(1<<16) run-count split with ~96 event-mass chunks to fix whale-run serialization on skewed data.
+- Combined A/B (above) showed ~4% regression; reverted to isolate — teardown v2 alone re-benched next.
