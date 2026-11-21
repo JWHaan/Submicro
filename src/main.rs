@@ -1245,7 +1245,9 @@ fn main() {
             tasks.push(Task { file: fi, cs, ce });
         }
     }
-    let shard_of = |eid: u64| (fx64(eid) as usize) & (NSHARD - 1);
+    // dedup_min_d indexes its counters and probe slots with the low bits.
+    // Partition by high bits so those low bits still vary inside each shard.
+    let shard_of = |eid: u64| (fx64(eid) >> (u64::BITS - NSHARD.ilog2())) as usize;
     let parsed: Vec<(Vec<FEv>, Vec<DIn>, Vec<u32>)> = tasks
         .par_iter()
         .map(|t| {
