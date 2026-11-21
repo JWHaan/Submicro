@@ -26,3 +26,6 @@ numbers rank builds only. Authoritative: bench.yml x86 A/B + track score.
 | Overlap clicks pipeline with events (scoped thread, clicks inline) | synth9-20M local: 5.6-6.9s vs ~5.3s sequential; cl_parse 256ms→2-3.2s under contention — both pipelines saturate all cores, nothing to hide in | REVERTED |
 | madvise(MADV_WILLNEED) on input mmaps + thread-local phase timing | local warm-cache 3.7-5.6s (unreliable); x86 CI decides | committed 77a22eb pending CI |
 | Fuse shard histogram into ev_parse (eliminates separate 640MB counting pass) | synth9-20M local: ev_scatter ~0.68s vs ~0.56-0.71s baseline (noisy); gates all green | committed this change pending CI |
+| x86 CI A/B run 44893442562: d5e72ed vs 7e24f7c @20M synth9 NCPU=4 | base 4350-4560ms → head 3722-3894ms (~15%); CSV identical; part-0 parquet bytes differ by design (8-part split vs single file) | parallel writers confirmed on x86 |
+| x86 CI A/B run 44893639460: 77a22eb (madvise) vs d5e72ed @20M synth9 NCPU=4 | base ~4350ms → head ~4415ms median (~1% slower, wash); CSV + all parquet parts identical | madvise a wash on x86; kept (hint can't hurt, may help cold cache on scorer) |
+| Fused ev filter+count+scatter+sort (per-task person-shard histograms, parallel disjoint-region scatter, per-shard sort) | synth9-20M local: ev_filter+ev_sort ~243ms combined; gates all green | committed pending CI |

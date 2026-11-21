@@ -1319,11 +1319,13 @@ fn main() {
         .collect();
     pt!("ev_dedup");
     let keeps_ref = &keeps;
-    let evs: Vec<Ev> = (0..NSHARD)
+    let pshard_of = |person: u64| (fx64(person) as usize) & (NSHARD - 1);
+    let ev_parts: Vec<(Vec<Ev>, Vec<u32>)> = (0..NSHARD)
         .into_par_iter()
-        .flat_map(|s| {
+        .map(|s| {
             let rows = &arena_ref[base_ref[s] as usize..base_ref[s + 1] as usize];
             let mut out = Vec::with_capacity(keeps_ref[s].len());
+            let mut cnt = vec![0u32; NSHARD];
             for &i in &keeps_ref[s] {
                 let d = rows[i as usize];
                 if d.uid == 0 || d.prod == 0 || d.etype == 3 || d.ts == T_INVALID || d.ts < ws
@@ -1346,6 +1348,7 @@ fn main() {
                 } else {
                     (0, 0)
                 };
+                cnt[pshard_of(person)] += 1;
                 out.push(Ev {
                     person,
                     ts: d.ts,
@@ -1353,13 +1356,55 @@ fn main() {
                     price,
                 });
             }
-            out
+            (out, cnt)
         })
         .collect();
     pt!("ev_filter");
-    let evs = shard_sort::<Ev, 256>(evs, |e| e.person, EV_E, |a, b| {
-        (a.person, a.ts).cmp(&(b.person, b.ts))
+    // parallel scatter into person-shard-grouped arena, then per-shard sort
+    let nt = ev_parts.len();
+    let mut prefix = vec![vec![0u32; NSHARD]; nt + 1];
+    for t in 0..nt {
+        for s in 0..NSHARD {
+            prefix[t + 1][s] = prefix[t][s] + ev_parts[t].1[s];
+        }
+    }
+    let mut pbase = vec![0u32; NSHARD + 1];
+    for s in 0..NSHARD {
+        pbase[s + 1] = pbase[s] + prefix[nt][s];
+    }
+    let total = pbase[NSHARD] as usize;
+    let mut ev_arena: Vec<Ev> = Vec::with_capacity(total);
+    let ev_ptr = RawPtr::<Ev>(ev_arena.as_mut_ptr() as usize, std::marker::PhantomData);
+    let parts_ref = &ev_parts;
+    let pbase_ref = &pbase;
+    let prefix_ref = &prefix;
+    (0..nt).into_par_iter().for_each(|t| {
+        let mut off: [u32; NSHARD] = [0; NSHARD];
+        for s in 0..NSHARD {
+            off[s] = pbase_ref[s] + prefix_ref[t][s];
+        }
+        let dst = ev_ptr.0 as *mut Ev;
+        for r in &parts_ref[t].0 {
+            let s = pshard_of(r.person);
+            unsafe { *dst.add(off[s] as usize) = *r };
+            off[s] += 1;
+        }
     });
+    unsafe { ev_arena.set_len(total) };
+    drop(ev_parts);
+    drop(prefix);
+    let mut rest: &mut [Ev] = &mut ev_arena;
+    let mut slices = Vec::with_capacity(NSHARD);
+    for s in 0..NSHARD {
+        let n = (pbase[s + 1] - pbase[s]) as usize;
+        let (a, b) = rest.split_at_mut(n);
+        slices.push(a);
+        rest = b;
+    }
+    slices.into_par_iter().for_each(|sl| {
+        sl.sort_unstable_by(|a, b| (a.person, a.ts).cmp(&(b.person, b.ts)))
+    });
+    let evs = ev_arena;
     pt!("ev_sort");
 
     // ---------------- clicks ----------------
