@@ -1646,13 +1646,17 @@ fn main() {
 
     fs::create_dir_all(outdir.join("user_daily")).unwrap();
     fs::create_dir_all(outdir.join("campaign_daily")).unwrap();
-    write_user_parquet(&outdir.join("user_daily"), &ud_rows, &cat_tab);
-    write_camp_parquet(
-        &outdir.join("campaign_daily"),
-        &cd_rows,
-        &camp_names,
-        &camp_chan,
-        organic_camp,
+    rayon::join(
+        || write_user_parquet(&outdir.join("user_daily"), &ud_rows, &cat_tab),
+        || {
+            write_camp_parquet(
+                &outdir.join("campaign_daily"),
+                &cd_rows,
+                &camp_names,
+                &camp_chan,
+                organic_camp,
+            )
+        },
     );
     pt!("output_rows");
     if write_csv {
@@ -1678,6 +1682,24 @@ fn write_user_parquet(
     rows: &[(u64, i64, u64, u64, i64, Option<u32>)],
     cat_tab: &[Box<[u8]>],
 ) {
+    let nth = rayon::current_num_threads().min(rows.len().max(1));
+    let chunk = rows.len().div_ceil(nth);
+    (0..nth).into_par_iter().for_each(|i| {
+        let lo = i * chunk;
+        let hi = (lo + chunk).min(rows.len());
+        if lo >= hi && !(i == 0 && rows.is_empty()) {
+            return;
+        }
+        write_user_part(dir, i, &rows[lo..hi], cat_tab);
+    });
+}
+
+fn write_user_part(
+    dir: &Path,
+    part: usize,
+    rows: &[(u64, i64, u64, u64, i64, Option<u32>)],
+    cat_tab: &[Box<[u8]>],
+) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("user_id", DataType::Utf8, false),
         Field::new("day", DataType::Date32, false),
@@ -1686,7 +1708,7 @@ fn write_user_parquet(
         Field::new("revenue_cents", DataType::Int64, false),
         Field::new("top_category", DataType::Utf8, true),
     ]));
-    let f = fs::File::create(dir.join("part-0.parquet")).unwrap();
+    let f = fs::File::create(dir.join(format!("part-{}.parquet", part))).unwrap();
     let props = WriterProperties::builder()
         .set_compression(Compression::UNCOMPRESSED)
         .build();
@@ -1735,6 +1757,26 @@ fn write_camp_parquet(
     camp_chan: &[Box<[u8]>],
     organic_camp: u32,
 ) {
+    let nth = rayon::current_num_threads().min(rows.len().max(1));
+    let chunk = rows.len().div_ceil(nth);
+    (0..nth).into_par_iter().for_each(|i| {
+        let lo = i * chunk;
+        let hi = (lo + chunk).min(rows.len());
+        if lo >= hi && !(i == 0 && rows.is_empty()) {
+            return;
+        }
+        write_camp_part(dir, i, &rows[lo..hi], camp_names, camp_chan, organic_camp);
+    });
+}
+
+fn write_camp_part(
+    dir: &Path,
+    part: usize,
+    rows: &[(u32, i64, u64, u64, i64, u64)],
+    camp_names: &[Box<[u8]>],
+    camp_chan: &[Box<[u8]>],
+    organic_camp: u32,
+) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("campaign_id", DataType::Utf8, false),
         Field::new("channel", DataType::Utf8, false),
@@ -1744,7 +1786,7 @@ fn write_camp_parquet(
         Field::new("revenue_cents", DataType::Int64, false),
         Field::new("assisted_sessions", DataType::Int64, false),
     ]));
-    let f = fs::File::create(dir.join("part-0.parquet")).unwrap();
+    let f = fs::File::create(dir.join(format!("part-{}.parquet", part))).unwrap();
     let props = WriterProperties::builder()
         .set_compression(Compression::UNCOMPRESSED)
         .build();

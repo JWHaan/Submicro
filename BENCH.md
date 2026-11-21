@@ -20,4 +20,5 @@ numbers rank builds only. Authoritative: bench.yml x86 A/B + track score.
 | Dense aggregation in sessionize (per-person day cells + camp×day array, no hashmaps) | synth9-20M: sessionize 10.2s→0.76s, total ~17.9s→~5.3s real | kept (617d086) |
 | x86 CI A/B run 44891525945: c8083bd vs 1f6d0b4 @20M synth9 NCPU=4 | base 28.9-31.1s → head 15.5-16.8s (~1.8x); spot-check script bug only | head faster |
 | uid StringArray direct offsets+values (no per-row String) | parquet byte-identical; output_rows ~same (sort dominates) | kept (this commit) |
-| Group-sort ud output: sort ~2M person-groups + gather, not ~10M rows | synth9-20M output_rows 2.03s→1.14s | kept (this commit) |
+| Group-sort ud output: sort ~2M person-groups + gather, not ~10M rows | synth9-20M output_rows 2.03s→1.14s | kept (7e24f7c) |
+| Parallel part-N.parquet writes (NCPU slices, rayon, both tables overlapped) | write_user_parquet split: cols 303ms / writer 764ms; synth9-20M output_rows 1.14s→0.575s; content verified identical | kept (this commit) |
