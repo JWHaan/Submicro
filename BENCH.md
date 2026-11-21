@@ -71,3 +71,13 @@ numbers rank builds only. Authoritative: bench.yml x86 A/B + track score.
 ## parquet ZSTD-1 — REVERTED (x86 regression)
 - x86 CI A/B run 44899018969: 7815c70 (ZSTD-1) vs 2620447 @20M NCPU=4 | base 3370-3539ms (med ~3471) → head 3536-3649ms (med ~3607, ~4% SLOWER); CSV identical, parquet DIFFERS as designed (semantic MATCH proven via pqcmp locally).
 - Verdict: zstd-1 CPU cost exceeds dirty-page flush savings at this scale. Reverted compression to UNCOMPRESSED + dropped zstd feature; kept pqcmp.rs (useful comparator, no runtime cost).
+
+## mimalloc env tuning (PURGE_DELAY=-1, THP=1) — KEPT
+- be9c190: run.sh exports MIMALLOC_PURGE_DELAY=-1 MIMALLOC_THP=1 — musl port of the competitor GLIBC_TUNABLES trick (arnabxero purge-free + kaedeng hugetlb).
+- Gate: fixtures 36/36, dev CSV parity identical (env-only change, binary unchanged).
+- x86 CI A/B run 44907976203 vs be363ff @20M NCPU=4: base 2991-3167ms (med ~3040) → head 2930-3177ms (med ~3001, ~1.3%). Small but consistent win; identical outputs. KEEP.
+
+## in-Docker PGO — KEPT (wash at 20M)
+- 11749be: Dockerfile gains synth training run — build synth, gen 3M events/750k clicks, instrumented -Cprofile-generate build, run inside build container, llvm-profdata merge, -Cprofile-use -Cprofile-correction rebuild (hansliu-dev recipe).
+- x86 CI A/B run 44908070010 vs be9c190 @20M NCPU=4: base 2898-3113ms (med ~3018) → head 2932-3166ms (med ~3007). Wash within noise; identical outputs. Competitors measured ~5%; not reproduced at 20M here.
+- KEEP as neutral: zero runtime cost, profile is real training data; plausible upside at 60M scale.
