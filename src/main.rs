@@ -16,7 +16,7 @@ use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHasher};
 
 use arrow_array::{Date32Array, Int64Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -1759,11 +1759,20 @@ fn main() {
     // ---------------- outputs ----------------
     let mut ud_groups = total.ud_groups;
     ud_groups.par_sort_unstable_by(|a, b| key_cmp(a.0, b.0));
-    let mut ud_rows: Vec<(u64, i64, u64, u64, i64, Option<u32>)> =
-        Vec::with_capacity(total.ud_out.len());
-    for &(_, s, l) in &ud_groups {
-        ud_rows.extend_from_slice(&total.ud_out[s as usize..(s + l) as usize]);
+    let mut goff: Vec<u32> = Vec::with_capacity(ud_groups.len() + 1);
+    goff.push(0);
+    for &(_, _, l) in &ud_groups {
+        goff.push(goff.last().unwrap() + l);
     }
+    let ud_rows: Vec<(u64, i64, u64, u64, i64, Option<u32>)> = if write_csv {
+        let mut ud_rows = Vec::with_capacity(total.ud_out.len());
+        for &(_, s, l) in &ud_groups {
+            ud_rows.extend_from_slice(&total.ud_out[s as usize..(s + l) as usize]);
+        }
+        ud_rows
+    } else {
+        Vec::new()
+    };
 
     let mut cd_rows: Vec<(u32, i64, u64, u64, i64, u64)> = Vec::new();
     for (i, a) in total.cd.iter().enumerate() {
@@ -1791,7 +1800,7 @@ fn main() {
     fs::create_dir_all(outdir.join("user_daily")).unwrap();
     fs::create_dir_all(outdir.join("campaign_daily")).unwrap();
     rayon::join(
-        || write_user_parquet(&outdir.join("user_daily"), &ud_rows, &cat_tab),
+        || write_user_parquet(&outdir.join("user_daily"), &total.ud_out, &ud_groups, &goff, &cat_tab),
         || {
             write_camp_parquet(
                 &outdir.join("campaign_daily"),
@@ -1821,29 +1830,41 @@ fn person_bytes<'a>(k: u64, s: &'a mut [u8; 10]) -> &'a [u8] {
     key_bytes(k, s)
 }
 
+type UdRow = (u64, i64, u64, u64, i64, Option<u32>);
+
 fn write_user_parquet(
     dir: &Path,
-    rows: &[(u64, i64, u64, u64, i64, Option<u32>)],
+    ud_out: &[UdRow],
+    groups: &[(u64, u32, u32)],
+    goff: &[u32],
     cat_tab: &[Box<[u8]>],
 ) {
-    let nth = rayon::current_num_threads().min(rows.len().max(1));
-    let chunk = rows.len().div_ceil(nth);
+    let nrows = *goff.last().unwrap() as usize;
+    let nth = rayon::current_num_threads().min(nrows.max(1));
+    let chunk = nrows.div_ceil(nth);
     (0..nth).into_par_iter().for_each(|i| {
         let lo = i * chunk;
-        let hi = (lo + chunk).min(rows.len());
-        if lo >= hi && !(i == 0 && rows.is_empty()) {
+        let hi = (lo + chunk).min(nrows);
+        if lo >= hi && !(i == 0 && nrows == 0) {
             return;
         }
-        write_user_part(dir, i, &rows[lo..hi], cat_tab);
+        write_user_part(dir, i, ud_out, groups, goff, lo, hi, cat_tab);
     });
 }
 
 fn write_user_part(
     dir: &Path,
     part: usize,
-    rows: &[(u64, i64, u64, u64, i64, Option<u32>)],
+    ud_out: &[UdRow],
+    groups: &[(u64, u32, u32)],
+    goff: &[u32],
+    lo: usize,
+    hi: usize,
     cat_tab: &[Box<[u8]>],
 ) {
+    // groups whose output ranges [goff[g], goff[g]+len) intersect [lo, hi)
+    let g_lo = goff[1..].partition_point(|&e| (e as usize) <= lo);
+    let g_hi = goff.partition_point(|&e| (e as usize) < hi).min(groups.len());
     let schema = Arc::new(Schema::new(vec![
         Field::new("user_id", DataType::Utf8, false),
         Field::new("day", DataType::Date32, false),
@@ -1858,40 +1879,76 @@ fn write_user_part(
         .build();
     let mut w = ArrowWriter::try_new(f, schema.clone(), Some(props)).unwrap();
     const CHUNK: usize = 2_000_000;
-    for chunk in rows.chunks(CHUNK) {
-        let mut vals: Vec<u8> = Vec::with_capacity(chunk.len() * 8);
-        let mut offs: Vec<i32> = Vec::with_capacity(chunk.len() + 1);
-        offs.push(0);
-        for r in chunk {
-            let mut s = [0u8; 10];
-            vals.extend_from_slice(person_bytes(r.0, &mut s));
-            offs.push(vals.len() as i32);
+    let mut vals: Vec<u8> = Vec::with_capacity(CHUNK.min(hi - lo) * 8);
+    let mut offs: Vec<i32> = Vec::with_capacity(CHUNK.min(hi - lo) + 1);
+    let mut day: Vec<i32> = Vec::with_capacity(CHUNK.min(hi - lo));
+    let mut sess: Vec<i64> = Vec::with_capacity(CHUNK.min(hi - lo));
+    let mut ev: Vec<i64> = Vec::with_capacity(CHUNK.min(hi - lo));
+    let mut rev: Vec<i64> = Vec::with_capacity(CHUNK.min(hi - lo));
+    let mut top: Vec<Option<&str>> = Vec::with_capacity(CHUNK.min(hi - lo));
+    offs.push(0);
+    let mut cur = 0usize;
+    for g in g_lo..g_hi {
+        let &(_, s, l) = &groups[g];
+        let gstart = goff[g] as usize;
+        let mut a = lo.max(gstart) - gstart;
+        let b = hi.min(gstart + l as usize) - gstart;
+        while a < b {
+            let take = (b - a).min(CHUNK - cur);
+            for r in &ud_out[s as usize + a..s as usize + a + take] {
+                let mut sc = [0u8; 10];
+                vals.extend_from_slice(person_bytes(r.0, &mut sc));
+                offs.push(vals.len() as i32);
+                day.push(r.1 as i32);
+                sess.push(r.2 as i64);
+                ev.push(r.3 as i64);
+                rev.push(r.4);
+                top.push(r.5.map(|c| str_of(&cat_tab[c as usize])));
+            }
+            a += take;
+            cur += take;
+            if cur == CHUNK {
+                flush_user_batch(&mut w, &schema, &mut vals, &mut offs, &mut day, &mut sess, &mut ev, &mut rev, &mut top);
+                cur = 0;
+            }
         }
-        let uid =
-            StringArray::new(arrow_buffer::OffsetBuffer::new(offs.into()), vals.into(), None);
-        let day: Vec<i32> = chunk.iter().map(|r| r.1 as i32).collect();
-        let sess: Vec<i64> = chunk.iter().map(|r| r.2 as i64).collect();
-        let ev: Vec<i64> = chunk.iter().map(|r| r.3 as i64).collect();
-        let rev: Vec<i64> = chunk.iter().map(|r| r.4).collect();
-        let top: Vec<Option<&str>> = chunk
-            .iter()
-            .map(|r| r.5.map(|c| str_of(&cat_tab[c as usize])))
-            .collect();
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(uid)),
-                Arc::new(Date32Array::from(day)),
-                Arc::new(Int64Array::from(sess)),
-                Arc::new(Int64Array::from(ev)),
-                Arc::new(Int64Array::from(rev)),
-                Arc::new(StringArray::from(top)),
-            ],
-        )
-        .unwrap();
-        w.write(&batch).unwrap();
+    }
+    if cur > 0 {
+        flush_user_batch(&mut w, &schema, &mut vals, &mut offs, &mut day, &mut sess, &mut ev, &mut rev, &mut top);
     }
     w.close().unwrap();
+}
+
+fn flush_user_batch(
+    w: &mut ArrowWriter<fs::File>,
+    schema: &SchemaRef,
+    vals: &mut Vec<u8>,
+    offs: &mut Vec<i32>,
+    day: &mut Vec<i32>,
+    sess: &mut Vec<i64>,
+    ev: &mut Vec<i64>,
+    rev: &mut Vec<i64>,
+    top: &mut Vec<Option<&str>>,
+) {
+    let uid = StringArray::new(
+        arrow_buffer::OffsetBuffer::new(std::mem::take(offs).into()),
+        std::mem::take(vals).into(),
+        None,
+    );
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(uid)),
+            Arc::new(Date32Array::from(std::mem::take(day))),
+            Arc::new(Int64Array::from(std::mem::take(sess))),
+            Arc::new(Int64Array::from(std::mem::take(ev))),
+            Arc::new(Int64Array::from(std::mem::take(rev))),
+            Arc::new(StringArray::from(std::mem::take(top))),
+        ],
+    )
+    .unwrap();
+    w.write(&batch).unwrap();
+    offs.push(0);
 }
 
 fn write_camp_parquet(
