@@ -301,6 +301,16 @@ fn atoi(s: &[u8]) -> i64 {
     v
 }
 
+/// All 8 lanes are ASCII digits ('0'..='9'). Carry-in can only narrow a
+/// lane's pass range, and carries originate only at lanes that already
+/// fail the high-nibble test, so no false positives/negatives.
+#[inline(always)]
+fn swar_digits(w: u64) -> bool {
+    const HI: u64 = 0xF0F0F0F0F0F0F0F0;
+    const D3: u64 = 0x3030303030303030;
+    (w & HI) == D3 && (w.wrapping_add(0x0606060606060606) & HI) == D3
+}
+
 /// Epoch ms, or T_INVALID on any violation. Same strictness as the reference.
 fn parse_ts(s: &[u8]) -> i64 {
     if s.is_empty() {
@@ -314,43 +324,51 @@ fn parse_ts(s: &[u8]) -> i64 {
         return v;
     }
     let n = s.len();
-    let (base, off_ms) = if n == 20 && s[19] == b'Z' {
-        (&s[..19], 0i64)
+    let off_ms = if n == 20 && s[19] == b'Z' {
+        0i64
     } else if n == 25
         && (s[19] == b'+' || s[19] == b'-')
         && s[22] == b':'
         && is_digits(&s[20..22])
         && is_digits(&s[23..25])
     {
-        let oh = atoi(&s[20..22]);
-        let om = atoi(&s[23..25]);
+        let oh = (s[20] - b'0') as i64 * 10 + (s[21] - b'0') as i64;
+        let om = (s[23] - b'0') as i64 * 10 + (s[24] - b'0') as i64;
         if oh > 23 || om > 59 {
             return T_INVALID;
         }
         let o = (oh * 60 + om) * 60000;
-        (&s[..19], if s[19] == b'+' { o } else { -o })
+        if s[19] == b'+' {
+            o
+        } else {
+            -o
+        }
     } else {
         return T_INVALID;
     };
-    if !(base[4] == b'-'
-        && base[7] == b'-'
-        && base[10] == b'T'
-        && base[13] == b':'
-        && base[16] == b':')
+    if !(s[4] == b'-' && s[7] == b'-' && s[10] == b'T' && s[13] == b':' && s[16] == b':') {
+        return T_INVALID;
+    }
+    // SWAR digit check over the 14 digit positions; separator lanes are
+    // masked to '0' (already verified above), byte 19 masked (checked as
+    // 'Z'/'+''-' by the length test).
+    let w0 = u64::from_le_bytes(s[0..8].try_into().unwrap());
+    let w1 = u64::from_le_bytes(s[8..16].try_into().unwrap());
+    let x2 = (u32::from_le_bytes(s[16..20].try_into().unwrap()) & 0x00FFFF00) | 0x30000030;
+    if !swar_digits((w0 & 0x00FFFF00FFFFFFFF) | 0x3000003000000000)
+        || !swar_digits((w1 & 0xFFFF00FFFF00FFFF) | 0x0000300000300000)
+        || (x2 & 0xF0F0F0F0 != 0x30303030)
+        || (x2.wrapping_add(0x06060606) & 0xF0F0F0F0 != 0x30303030)
     {
         return T_INVALID;
     }
-    for &i in &[0usize, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
-        if !base[i].is_ascii_digit() {
-            return T_INVALID;
-        }
-    }
-    let y = atoi(&base[0..4]);
-    let mo = atoi(&base[5..7]);
-    let d = atoi(&base[8..10]);
-    let h = atoi(&base[11..13]);
-    let mi = atoi(&base[14..16]);
-    let sec = atoi(&base[17..19]);
+    let dg = |i: usize| (s[i] - b'0') as i64;
+    let y = dg(0) * 1000 + dg(1) * 100 + dg(2) * 10 + dg(3);
+    let mo = dg(5) * 10 + dg(6);
+    let d = dg(8) * 10 + dg(9);
+    let h = dg(11) * 10 + dg(12);
+    let mi = dg(14) * 10 + dg(15);
+    let sec = dg(17) * 10 + dg(18);
     if mo < 1 || mo > 12 || h > 23 || mi > 59 || sec > 59 {
         return T_INVALID;
     }
