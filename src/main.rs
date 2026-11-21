@@ -1657,13 +1657,27 @@ fn main() {
     let n_days = ((we - 1) / D24 - day_lo + 1) as usize;
     let nslots = n_camps as usize + 1;
     let cat_tab_ref = &cat_tab;
-    let total = ev_runs
-        .par_iter()
-        .enumerate()
-        .with_min_len(1 << 16)
-        .fold(
-            || Acc::new(n_days, n_camps, day_lo),
-            |mut acc, (ri, &(person, lo, hi))| {
+    // Chunk runs by event mass, not run count: Zipf activity makes equal-run
+    // chunks wildly unbalanced (whale runs straggle single threads).
+    let n_chunks = 96usize.min(ev_runs.len().max(1));
+    let mut bounds: Vec<u32> = Vec::with_capacity(n_chunks + 2);
+    bounds.push(0);
+    {
+        let total_ev = evs.len() as u64;
+        let mut cum = 0u64;
+        let mut k = 1u64;
+        for (i, &(_, lo, hi)) in ev_runs.iter().enumerate() {
+            cum += (hi - lo) as u64;
+            while k < n_chunks as u64 && cum * n_chunks as u64 >= total_ev * k {
+                bounds.push((i + 1) as u32);
+                k += 1;
+            }
+        }
+        bounds.push(ev_runs.len() as u32);
+        bounds.dedup();
+    }
+    let do_run = |acc: &mut Acc, ri: usize| {
+        let &(person, lo, hi) = &ev_runs[ri];
                 acc.sessions.clear();
                 acc.ats.clear();
                 acc.acamp.clear();
@@ -1767,9 +1781,16 @@ fn main() {
                 if glen > 0 {
                     acc.ud_groups.push((person, gstart, glen));
                 }
-                acc
-            },
-        )
+            };
+    let total = bounds
+        .par_windows(2)
+        .map(|w| {
+            let mut acc = Acc::new(n_days, n_camps, day_lo);
+            for ri in w[0] as usize..w[1] as usize {
+                do_run(&mut acc, ri);
+            }
+            acc
+        })
         .reduce(Acc::default, |mut a, b| {
             a.merge(b);
             a
