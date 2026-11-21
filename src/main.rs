@@ -47,19 +47,39 @@ fn buf(f: u16) -> &'static [u8] {
 // Longer/other ids -> fallback interner, key = FB_TAG | (local*64 + shard).
 // ---------------------------------------------------------------------------
 #[inline]
+const fn build_pack_tab() -> [u8; 256] {
+    let mut t = [0xFFu8; 256];
+    let mut i = 0;
+    while i < 10 {
+        t[b'0' as usize + i] = i as u8 + 1;
+        i += 1;
+    }
+    let mut i = 0;
+    while i < 26 {
+        t[b'A' as usize + i] = i as u8 + 11;
+        i += 1;
+    }
+    t[b'_' as usize] = 37;
+    let mut i = 0;
+    while i < 26 {
+        t[b'a' as usize + i] = i as u8 + 38;
+        i += 1;
+    }
+    t
+}
+static PACK_TAB: [u8; 256] = build_pack_tab();
+
+#[inline(always)]
 fn packable(s: &[u8]) -> u64 {
     if s.is_empty() || s.len() > 10 {
         return u64::MAX; // signal: not packable
     }
     let mut k = 0u64;
     for &c in s {
-        let v = match c {
-            b'0'..=b'9' => c - b'0' + 1,
-            b'A'..=b'Z' => c - b'A' + 11,
-            b'_' => 37,
-            b'a'..=b'z' => c - b'a' + 38,
-            _ => return u64::MAX,
-        };
+        let v = PACK_TAB[c as usize];
+        if v == 0xFF {
+            return u64::MAX;
+        }
         k = (k << 6) | v as u64;
     }
     // Left-align in 60 bits: pad with zero digits so integer order == byte order.
