@@ -707,6 +707,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-schema",
+ "bytes",
  "libc",
  "memchr",
  "memmap2",
@@ -714,6 +715,7 @@ dependencies = [
  "parquet",
  "rayon",
  "rustc-hash",
+ "snap",
 ]
 
 [[package]]

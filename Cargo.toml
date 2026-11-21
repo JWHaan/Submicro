@@ -20,3 +20,7 @@ parquet = { version = "56", default-features = false, features = ["arrow", "snap
 arrow-array = "56"
 arrow-schema = "56"
 arrow-buffer = "56"
+snap = "1"
+
+[dev-dependencies]
+bytes = "1"
