@@ -3,6 +3,30 @@
 Scorer: ~20M events, linux/amd64, 8 vCPU, 24 GB. Local Mac is ARM — its
 numbers rank builds only. Authoritative: bench.yml x86 A/B + track score.
 
+## Hot-path candidates: correctness gates, no timing verdict yet
+
+All candidates start from `73dd703`. Each explicit release binary matched
+both official fixture tables (36/36), the dev answer (117,038 user and 27,400
+campaign rows), and Python-oracle results for five established seeds plus
+1001..1020 at 30k events each. Checked decoded Parquet types/values and CSV
+values, including empty tables; stdout was empty. `pqcmp` also matched both
+whole dev tables with the verified baseline. These are not performance runs.
+
+| Experiment | Code | Benchmark head | Local gate | x86 20M/60M |
+|---|---|---|---|---|
+| A: structural scanner | `566ae2f` | `c2e96f5` | arm64 gate; AVX2 scanner unit tests under emulation | pending |
+| B: direct Parquet pages, skip row sorting | `a8793df` | `7876853` | arm64 gate separately for Snappy and uncompressed | pending |
+| C: mmap, mremap, bounded reuse | `0942d28` | `58099d2` | Linux/arm64 release gate after MAP_NORESERVE; Linux allocator tests | pending |
+| D: inline 128-bit IDs | `a0ef8dd` | `281820b` | arm64 gate; wider records add 2.4 GB at the 60M scatter | pending |
+| D2: disjoint shard/table hash bits | `206d65e` | `2b22d60` | arm64 gate; full-key comparison unchanged | pending |
+
+The benchmark heads contain the same harness (`adb91c6` on `exp/hot-bench`).
+It checks the official public kit by checksum, builds both amd64 Dockerfiles,
+compares both decoded tables, interleaves container lifetimes and reports
+phase timing, system CPU, page faults and RSS separately. Its 12 GiB
+container limit and runner CPU count are not the scorer's 24 GB / 8 vCPUs.
+No new scorer time or CI medians have been observed; master is unchanged.
+
 ## Scores
 | commit | score | notes |
 |---|---|---|
