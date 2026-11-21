@@ -63,3 +63,11 @@ numbers rank builds only. Authoritative: bench.yml x86 A/B + track score.
 - Added src/bin/pqcmp.rs — semantic parquet comparator (schema + sorted row multiset) since outputs differ byte-wise by design.
 - Gate: fixtures 36/36, dev CSV parity, diff 5/5, adversarial match, pqcmp MATCH (user_daily 117038 rows, campaign_daily 27400 rows vs uncompressed build; ~1.75x smaller files).
 - x86 CI A/B pending vs parent.
+
+## teardown v2 — x86 verdict (run 44898714635)
+- d629351-era teardown v2 (+ parser fixes) vs 68abd99 @20M NCPU=4: base 4211-4360ms (med ~4236) → head 4125-4352ms (med ~4241). Wash within noise; outputs identical; **no crash** — buffer-scoped madvise is safe on x86.
+- KEEP as neutral: zero regression, exits cleanly; benefit plausibly larger at 60M (more pages to unmap). NO_TEARDOWN opt-out retained.
+
+## parquet ZSTD-1 — REVERTED (x86 regression)
+- x86 CI A/B run 44899018969: 7815c70 (ZSTD-1) vs 2620447 @20M NCPU=4 | base 3370-3539ms (med ~3471) → head 3536-3649ms (med ~3607, ~4% SLOWER); CSV identical, parquet DIFFERS as designed (semantic MATCH proven via pqcmp locally).
+- Verdict: zstd-1 CPU cost exceeds dirty-page flush savings at this scale. Reverted compression to UNCOMPRESSED + dropped zstd feature; kept pqcmp.rs (useful comparator, no runtime cost).

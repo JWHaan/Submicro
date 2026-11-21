@@ -18,7 +18,7 @@ use rustc_hash::{FxHashMap, FxHasher};
 use arrow_array::{Date32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression, ZstdLevel};
+use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
 #[global_allocator]
@@ -1949,7 +1949,7 @@ fn write_user_part(
     ]));
     let f = fs::File::create(dir.join(format!("part-{}.parquet", part))).unwrap();
     let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(1).unwrap()))
+        .set_compression(Compression::UNCOMPRESSED)
         .build();
     let mut w = ArrowWriter::try_new(f, schema.clone(), Some(props)).unwrap();
     const CHUNK: usize = 2_000_000;
@@ -2063,7 +2063,7 @@ fn write_camp_part(
     ]));
     let f = fs::File::create(dir.join(format!("part-{}.parquet", part))).unwrap();
     let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(1).unwrap()))
+        .set_compression(Compression::UNCOMPRESSED)
         .build();
     let mut w = ArrowWriter::try_new(f, schema.clone(), Some(props)).unwrap();
     const CHUNK: usize = 2_000_000;
