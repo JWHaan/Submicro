@@ -21,4 +21,6 @@ numbers rank builds only. Authoritative: bench.yml x86 A/B + track score.
 | x86 CI A/B run 44891525945: c8083bd vs 1f6d0b4 @20M synth9 NCPU=4 | base 28.9-31.1s → head 15.5-16.8s (~1.8x); spot-check script bug only | head faster |
 | uid StringArray direct offsets+values (no per-row String) | parquet byte-identical; output_rows ~same (sort dominates) | kept (this commit) |
 | Group-sort ud output: sort ~2M person-groups + gather, not ~10M rows | synth9-20M output_rows 2.03s→1.14s | kept (7e24f7c) |
-| Parallel part-N.parquet writes (NCPU slices, rayon, both tables overlapped) | write_user_parquet split: cols 303ms / writer 764ms; synth9-20M output_rows 1.14s→0.575s; content verified identical | kept (this commit) |
+| Parallel part-N.parquet writes (NCPU slices, rayon, both tables overlapped) | write_user_parquet split: cols 303ms / writer 764ms; synth9-20M output_rows 1.14s→0.575s; content verified identical | kept (d5e72ed) |
+| x86 CI A/B run 44892617851: 7e24f7c vs c8083bd @20M synth9 NCPU=4 | base 17.9-19.4s → head 5.10-5.36s (~3.6x); CSV + parquet identical | dense-agg+group-sort confirmed on x86 |
+| Overlap clicks pipeline with events (scoped thread, clicks inline) | synth9-20M local: 5.6-6.9s vs ~5.3s sequential; cl_parse 256ms→2-3.2s under contention — both pipelines saturate all cores, nothing to hide in | REVERTED |

@@ -706,6 +706,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-schema",
+ "libc",
  "memchr",
  "memmap2",
  "mimalloc",

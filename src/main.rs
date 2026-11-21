@@ -31,6 +31,9 @@ const ORGANIC: &[u8] = b"organic";
 const FB_TAG: u64 = 0xF << 60; // fallback key tag (top nibble); packed keys stay below
 
 static FILES: OnceLock<Vec<&'static [u8]>> = OnceLock::new();
+thread_local! {
+    static T_LAST: std::cell::Cell<std::time::Instant> = std::cell::Cell::new(std::time::Instant::now());
+}
 
 #[inline]
 fn buf(f: u16) -> &'static [u8] {
@@ -1000,14 +1003,26 @@ fn main() {
     let prod_f = (file_list.len() - 2) as u16;
     let camp_f = (file_list.len() - 1) as u16;
     FILES.set(file_list).unwrap();
+    #[cfg(unix)]
+    {
+        let files = FILES.get().unwrap().clone();
+        std::thread::spawn(move || {
+            for b in files {
+                unsafe {
+                    libc::madvise(b.as_ptr() as *mut libc::c_void, b.len(), libc::MADV_WILLNEED);
+                }
+            }
+        });
+    }
     let phase_timing = env::var("PHASE_TIMING").is_ok();
-    let mut t_last = std::time::Instant::now();
     macro_rules! pt {
         ($name:expr) => {
             if phase_timing {
                 let n = std::time::Instant::now();
-                eprintln!("[phase] {}: {:?}", $name, n - t_last);
-                t_last = n;
+                T_LAST.with(|t| {
+                    eprintln!("[phase] {}: {:?}", $name, n - t.get());
+                    t.set(n);
+                });
             }
         };
     }
@@ -1152,6 +1167,7 @@ fn main() {
         cs: usize,
         ce: usize,
     }
+    const NSHARD: usize = 256;
     let mut tasks = Vec::new();
     for f in 0..nev {
         let fi = f as u16;
@@ -1247,7 +1263,6 @@ fn main() {
 
     // single-arena scatter by eid-hash: per-task histograms -> global offsets
     // -> each task writes directly into its disjoint (task, shard) region.
-    const NSHARD: usize = 256;
     let shard_of = |eid: u64| (fx64(eid) as usize) & (NSHARD - 1);
     let cnts: Vec<Vec<u32>> = task_rows
         .par_iter()
