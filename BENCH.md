@@ -87,3 +87,7 @@ numbers rank builds only. Authoritative: bench.yml x86 A/B + track score.
 - Gate: fixtures 36/36, dev CSV parity identical, diff 5/5 vs ref.py.
 - x86 CI A/B run 44908796491 vs a2f502c @20M NCPU=4: base 3339-3814ms (med ~3446) -> head 3344-3424ms (med ~3366, ~2.3%). All 7 head runs below base median; parquet byte-identical. KEEP.
 - Known caveat (corpus): single-entry caches miss ~93% on shuffled input (joch44 v10). Upgrade path: small day-indexed table if hidden data proves unordered.
+
+## in-Docker PGO — REVERTED (build failure under emulation)
+- 11749be's instrumented training run exited 101 inside docker build on an ARM Mac building linux/amd64 (qemu-user): the synth layer runs fine, the profile-generate run panics under emulation. x86 CI had built it fine (run 44908070010) and measured it a wash (~0.4%, noise) — zero measured upside to justify a build-time failure mode.
+- Reverted the Dockerfile to the single cargo-build shape of be363ff. mimalloc env (be9c190) and date-prefix cache (aa038e4) unaffected. If PGO is revisited, gate the training run behind a fallback so a failed profile capture degrades to a non-PGO build rather than failing the image.
