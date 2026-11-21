@@ -60,8 +60,9 @@ jobs:
       - name: Spot-check outputs agree
         run: |
           rm -rf out_a out_b && mkdir -p out_a out_b
-          DATA_DIR=data OUTPUT_DIR=out_a NCPU=4 ./base-bin
-          DATA_DIR=data OUTPUT_DIR=out_b NCPU=4 ./head-bin
-          find out_a -name '*.parquet' | sort > /tmp/fa
-          find out_b -name '*.parquet' | sort > /tmp/fb
-          diff /tmp/fa /tmp/fb && echo "same file layout"
+          WRITE_CSV=1 DATA_DIR=data OUTPUT_DIR=out_a NCPU=4 ./base-bin
+          WRITE_CSV=1 DATA_DIR=data OUTPUT_DIR=out_b NCPU=4 ./head-bin
+          diff -r -x '*.parquet' out_a out_b && echo "CSV identical"
+          (cd out_a && find . -name '*.parquet') | while read -r f; do
+            cmp -s "out_a/$f" "out_b/$f" && echo "parquet $f: identical" || echo "parquet $f: DIFFERS"
+          done

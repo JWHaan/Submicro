@@ -800,6 +800,7 @@ impl Alive {
 #[derive(Default)]
 struct Acc {
     ud_out: Vec<(u64, i64, u64, u64, i64, Option<u32>)>,
+    ud_groups: Vec<(u64, u32, u32)>,
     cd: Vec<CdAcc>,
     cells: Vec<UdCell>,
     touched: Vec<u32>,
@@ -822,7 +823,10 @@ impl Acc {
         a
     }
     fn merge(&mut self, o: Acc) {
+        let base = self.ud_out.len() as u32;
         self.ud_out.extend(o.ud_out);
+        self.ud_groups
+            .extend(o.ud_groups.iter().map(|&(k, s, l)| (k, s + base, l)));
         if self.cd.len() < o.cd.len() {
             self.cd = o.cd;
             return;
@@ -1568,6 +1572,7 @@ fn main() {
                         acc.cd[base + c as usize].assist += 1;
                     }
                 }
+                let gstart = acc.ud_out.len() as u32;
                 for &di in acc.touched.iter() {
                     let c = &mut acc.cells[di as usize];
                     let top = c
@@ -1594,6 +1599,10 @@ fn main() {
                     c.used = false;
                 }
                 acc.touched.clear();
+                let glen = acc.ud_out.len() as u32 - gstart;
+                if glen > 0 {
+                    acc.ud_groups.push((person, gstart, glen));
+                }
                 acc
             },
         )
@@ -1604,8 +1613,13 @@ fn main() {
     pt!("sessionize");
 
     // ---------------- outputs ----------------
-    let mut ud_rows = total.ud_out;
-    ud_rows.sort_by(|a, b| key_cmp(a.0, b.0).then(a.1.cmp(&b.1)));
+    let mut ud_groups = total.ud_groups;
+    ud_groups.par_sort_unstable_by(|a, b| key_cmp(a.0, b.0));
+    let mut ud_rows: Vec<(u64, i64, u64, u64, i64, Option<u32>)> =
+        Vec::with_capacity(total.ud_out.len());
+    for &(_, s, l) in &ud_groups {
+        ud_rows.extend_from_slice(&total.ud_out[s as usize..(s + l) as usize]);
+    }
 
     let mut cd_rows: Vec<(u32, i64, u64, u64, i64, u64)> = Vec::new();
     for (i, a) in total.cd.iter().enumerate() {
@@ -1679,13 +1693,16 @@ fn write_user_parquet(
     let mut w = ArrowWriter::try_new(f, schema.clone(), Some(props)).unwrap();
     const CHUNK: usize = 2_000_000;
     for chunk in rows.chunks(CHUNK) {
-        let uid: Vec<String> = chunk
-            .iter()
-            .map(|r| {
-                let mut s = [0u8; 10];
-                str_of(person_bytes(r.0, &mut s)).to_string()
-            })
-            .collect();
+        let mut vals: Vec<u8> = Vec::with_capacity(chunk.len() * 8);
+        let mut offs: Vec<i32> = Vec::with_capacity(chunk.len() + 1);
+        offs.push(0);
+        for r in chunk {
+            let mut s = [0u8; 10];
+            vals.extend_from_slice(person_bytes(r.0, &mut s));
+            offs.push(vals.len() as i32);
+        }
+        let uid =
+            StringArray::new(arrow_buffer::OffsetBuffer::new(offs.into()), vals.into(), None);
         let day: Vec<i32> = chunk.iter().map(|r| r.1 as i32).collect();
         let sess: Vec<i64> = chunk.iter().map(|r| r.2 as i64).collect();
         let ev: Vec<i64> = chunk.iter().map(|r| r.3 as i64).collect();
