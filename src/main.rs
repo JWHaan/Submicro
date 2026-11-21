@@ -316,7 +316,7 @@ fn civil_from_days(z0: i64) -> (i64, i64, i64) {
 fn atoi(s: &[u8]) -> i64 {
     let mut v = 0i64;
     for &c in s {
-        v = v * 10 + (c - b'0') as i64;
+        v = v.saturating_mul(10).saturating_add((c - b'0') as i64);
     }
     v
 }
@@ -702,12 +702,23 @@ fn each_line<F: FnMut(&[Option<(u32, u32)>; 8], &[u8])>(
         fstart = d + 1;
         p = d + 1;
     }
-    // File ended right after a comma: one pending empty field remains.
+    // File ended right after a delimiter: one pending field remains — run the
+    // same validation as the newline path (a trailing quote can make it
+    // malformed; an empty tail becomes null).
     if n > 0 && n < ncols {
-        fields[n] = None;
-        n += 1;
-        if n == ncols && ok {
-            f(&fields, b);
+        let flen = hi - fstart;
+        ok = ok && field_ok(&b[fstart..hi], q, flen);
+        if ok {
+            let (o, l) = field_span(&b[fstart..hi], q, flen);
+            fields[n] = if o == u32::MAX {
+                None
+            } else {
+                Some(((fstart - lo) as u32 + o, l))
+            };
+            n += 1;
+            if n == ncols {
+                f(&fields, b);
+            }
         }
     }
 }

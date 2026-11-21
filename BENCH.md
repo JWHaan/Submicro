@@ -59,3 +59,4 @@ numbers rank builds only. Authoritative: bench.yml x86 A/B + track score.
 - Gate: fixtures 36/36, dev parity OK, diff 5/5, adversarial OK; clean exit rc=0 on every local run (madvise path actually executed on macOS).
 - x86 A/B vs 68abd99 (last verified-good, pre-teardown): pending — measures teardown v2 + event-balanced chunks combined.
 - Verdict: pending CI.
+| x86 CI A/B run 44896828545: 6db309e (packable 256B LUT) vs fb2f810 @20M synth9 NCPU=4 | base 3579-4187ms (med ~3622) → head 3338-3453ms (med ~3381, ~6.7%); CSV + all parquet parts identical | packable LUT confirmed on x86 — KEEP |
