@@ -95,3 +95,11 @@ numbers rank builds only. Authoritative: bench.yml x86 A/B + track score.
 ## track score: 2.54s (submitted commit)
 - User submitted the post-revert lineage (master tip 3014a7a / 3d25bf7-family: mimalloc env + date-prefix cache, PGO reverted out of Dockerfile). Track page returned **2.54s** vs the previous 2.77s.
 - Consistent with the CI A/Bs (mimalloc ~1.3%, datecache ~2.3% medians at 20M NCPU=4) plus scorer variance.
+
+## snappy parquet compression — KEPT (~1.1%, mechanism confirmed)
+- 162a73c: Compression::UNCOMPRESSED -> SNAPPY in both writers + `snap` feature on parquet 56.
+- Gate: diff 5/5 vs ref.py; pqcmp semantic IDENTICAL at 62M scale (6,675,187 user_daily + 28,014 campaign_daily rows); output 93M -> 41M.
+- x86 CI A/B run 44914275576 vs 4f53ba9 @20M NCPU=4: base 3854-3996ms (med ~3965) -> head 3827-4012ms (med ~3922, ~1.1%, head wins 5/7). CSV identical; parquet bytes DIFFER (expected codec change — spot-check flags DIFFERS across codec boundaries, semantic equality via pqcmp).
+- Phase evidence: head output_rows +73ms (snappy CPU) but total -43ms => exit-flush savings ~115ms > codec cost. Should scale up at 60M (output ~3x).
+- KEEP. Note: workflow's `cmp` parquet check flags DIFFERS whenever base/head codecs differ; CSV diff + pqcmp are the real gates.
+- x86 phase shape @20M NCPU=4 (from this run): ev_parse ~950ms, output_rows ~700ms, sessionize ~615ms, ev_dedup ~480ms, ev_sort ~255ms, cl_* ~620ms, links ~15ms. => prefetch canon_of dead (links trivial); next levers: hand-rolled parquet (output_rows), SIMD tokenizer (ev_parse), sessionize internals, fp dedup (ev_dedup).
