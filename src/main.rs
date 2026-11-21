@@ -7,6 +7,7 @@ use std::fs;
 use std::hash::Hasher;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use memchr::{memchr, memchr3, memmem};
@@ -902,12 +903,17 @@ fn person_runs<T: Sync>(arr: &[T], key: impl Fn(&T) -> u64 + Sync) -> Vec<(u64, 
     out
 }
 
-// Open-addressing u64 key table over a rows slice; keeps the row index with
-// min `ingest` (first wins ties). Returns indices of surviving rows.
-fn dedup_min(rows: &[RawEv], keep: impl Fn(&RawEv) -> i64) -> Vec<u32> {
-    // 2-bit counting sketch: rows whose slot stayed at 1 are provably unique.
-    // Only potential duplicates (count>=2, incl. hash collisions) take the
-    // exact open-addressing path.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct DRec {
+    eid: u64,
+    ingest: i64,
+    gidx: u32,
+}
+
+// Open-addressing u64 key table over a dedup-record slice; keeps the row
+// index with min `ingest` (first wins ties). Returns surviving indices.
+fn dedup_min_d(rows: &[DRec]) -> Vec<u32> {
     let slots = (rows.len().max(16) * 4).next_power_of_two();
     let mut cnt = vec![0u64; slots / 32];
     for r in rows {
@@ -944,7 +950,7 @@ fn dedup_min(rows: &[RawEv], keep: impl Fn(&RawEv) -> i64) -> Vec<u32> {
                 break;
             }
             if keys[s] == r.eid {
-                if keep(r) < keep(&rows[vals[s] as usize]) {
+                if r.ingest < rows[vals[s] as usize].ingest {
                     vals[s] = i;
                 }
                 break;
@@ -1267,9 +1273,15 @@ fn main() {
 
     pt!("ev_parse");
 
-    // single-arena scatter by eid-hash: per-task histograms -> global offsets
-    // -> each task writes directly into its disjoint (task, shard) region.
+    // single-arena scatter by eid-hash over compact dedup records:
+    // per-task histograms -> global offsets -> each task writes directly
+    // into its disjoint (task, shard) region. task_rows stays in place;
+    // survivors are marked in `kept` and the filter scans rows in situ.
     let nt = task_rows.len();
+    let mut tbase = vec![0u32; nt + 1];
+    for t in 0..nt {
+        tbase[t + 1] = tbase[t] + task_rows[t].len() as u32;
+    }
     // prefix[t][s] = rows of shard s contributed by tasks 0..t
     let mut prefix = vec![vec![0u32; NSHARD]; nt + 1];
     for t in 0..nt {
@@ -1285,49 +1297,67 @@ fn main() {
     struct RawPtr<T>(usize, std::marker::PhantomData<T>);
     unsafe impl<T> Send for RawPtr<T> {}
     unsafe impl<T> Sync for RawPtr<T> {}
-    let mut arena: Vec<RawEv> = Vec::with_capacity(total);
-    let arena_ptr = RawPtr::<RawEv>(arena.as_mut_ptr() as usize, std::marker::PhantomData);
+    let mut arena: Vec<DRec> = Vec::with_capacity(total);
+    let arena_ptr = RawPtr::<DRec>(arena.as_mut_ptr() as usize, std::marker::PhantomData);
     let task_rows_ref = &task_rows;
     let base_ref = &base;
     let prefix_ref = &prefix;
+    let tbase_ref = &tbase;
     (0..nt).into_par_iter().for_each(|t| {
         let mut off: [u32; NSHARD] = [0; NSHARD];
         for s in 0..NSHARD {
             off[s] = base_ref[s] + prefix_ref[t][s];
         }
-        let dst = arena_ptr.0 as *mut RawEv;
-        for r in &task_rows_ref[t] {
+        let g0 = tbase_ref[t];
+        let dst = arena_ptr.0 as *mut DRec;
+        for (j, r) in task_rows_ref[t].iter().enumerate() {
             let s = shard_of(r.eid);
-            unsafe { *dst.add(off[s] as usize) = *r };
+            unsafe {
+                *dst.add(off[s] as usize) = DRec {
+                    eid: r.eid,
+                    ingest: r.ingest,
+                    gidx: g0 + j as u32,
+                }
+            };
             off[s] += 1;
         }
     });
     unsafe { arena.set_len(total) };
-    drop(task_rows);
     drop(cnts);
     drop(prefix);
     pt!("ev_scatter");
 
-    let prod_map_ref = &prod_map;
+    // per-eid-shard dedup -> mark surviving flat indices
     let arena_ref = &arena;
-    let keeps: Vec<Vec<u32>> = (0..NSHARD)
-        .into_par_iter()
-        .map(|s| {
-            let rows = &arena_ref[base_ref[s] as usize..base_ref[s + 1] as usize];
-            dedup_min(rows, |r| r.ingest)
-        })
-        .collect();
+    let kept: Vec<AtomicU8> = (0..total).map(|_| AtomicU8::new(0)).collect();
+    let kept_ptr = RawPtr::<AtomicU8>(kept.as_ptr() as usize, std::marker::PhantomData);
+    (0..NSHARD).into_par_iter().for_each(|s| {
+        let rows = &arena_ref[base_ref[s] as usize..base_ref[s + 1] as usize];
+        let dst = kept_ptr.0 as *const AtomicU8;
+        for i in dedup_min_d(rows) {
+            unsafe {
+                (*dst.add(rows[i as usize].gidx as usize)).store(1, Ordering::Relaxed)
+            };
+        }
+    });
+    drop(arena);
+    drop(base);
     pt!("ev_dedup");
-    let keeps_ref = &keeps;
+
+    let prod_map_ref = &prod_map;
+    let kept_ref = &kept;
     let pshard_of = |person: u64| (fx64(person) as usize) & (NSHARD - 1);
-    let ev_parts: Vec<(Vec<Ev>, Vec<u32>)> = (0..NSHARD)
+    let ev_parts: Vec<(Vec<Ev>, Vec<u32>)> = (0..nt)
         .into_par_iter()
-        .map(|s| {
-            let rows = &arena_ref[base_ref[s] as usize..base_ref[s + 1] as usize];
-            let mut out = Vec::with_capacity(keeps_ref[s].len());
+        .map(|t| {
+            let rows = &task_rows_ref[t];
+            let g0 = tbase_ref[t] as usize;
+            let mut out = Vec::with_capacity(rows.len());
             let mut cnt = vec![0u32; NSHARD];
-            for &i in &keeps_ref[s] {
-                let d = rows[i as usize];
+            for (j, d) in rows.iter().enumerate() {
+                if kept_ref[g0 + j].load(Ordering::Relaxed) == 0 {
+                    continue;
+                }
                 if d.uid == 0 || d.prod == 0 || d.etype == 3 || d.ts == T_INVALID || d.ts < ws
                     || d.ts >= we
                 {
@@ -1359,6 +1389,9 @@ fn main() {
             (out, cnt)
         })
         .collect();
+    drop(task_rows);
+    drop(kept);
+    drop(tbase);
     pt!("ev_filter");
     // parallel scatter into person-shard-grouped arena, then per-shard sort
     let nt = ev_parts.len();
