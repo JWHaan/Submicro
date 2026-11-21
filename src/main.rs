@@ -19,6 +19,9 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const MIN30: i64 = 1_800_000;
 const D24: i64 = 86_400_000;
 const D7: i64 = 604_800_000;
@@ -28,7 +31,7 @@ const ORGANIC: &[u8] = b"organic";
 
 // Every input file is mmap'd; buffers live for 'static in FILES.
 static FILES: OnceLock<Vec<&'static [u8]>> = OnceLock::new();
-static PERSON_OF: OnceLock<Vec<u32>> = OnceLock::new();
+static PERSONS: OnceLock<Persons> = OnceLock::new();
 
 #[inline]
 fn buf(f: u16) -> &'static [u8] {
@@ -249,37 +252,146 @@ fn line_chunks(b: &[u8], n: usize) -> Vec<(usize, usize)> {
 }
 
 // ---------------------------------------------------------------------------
-// Sharded concurrent interner
+// Sharded concurrent interner.
+// ID space is partitioned per shard: id = local_idx * ISHARD + shard.
+// Each shard owns its map+table under a single lock; there is no global lock.
 // ---------------------------------------------------------------------------
+const ISHARD: usize = 64;
+const ISHARD_MASK: u32 = (ISHARD - 1) as u32;
+
+struct InternerShard {
+    map: FxHashMap<Box<[u8]>, u32>,
+    tab: Vec<Box<[u8]>>,
+}
 struct Interner {
-    shards: Vec<RwLock<FxHashMap<Box<[u8]>, u32>>>,
-    table: RwLock<Vec<Box<[u8]>>>,
+    shards: Vec<RwLock<InternerShard>>,
 }
 impl Interner {
     fn new() -> Self {
         Interner {
-            shards: (0..64).map(|_| RwLock::new(FxHashMap::default())).collect(),
-            table: RwLock::new(Vec::new()),
+            shards: (0..ISHARD)
+                .map(|_| {
+                    RwLock::new(InternerShard {
+                        map: FxHashMap::default(),
+                        tab: Vec::new(),
+                    })
+                })
+                .collect(),
         }
     }
+    #[inline]
     fn intern(&self, s: &[u8]) -> u32 {
-        let i = (fxh(s) as usize) & (self.shards.len() - 1);
-        if let Some(&v) = self.shards[i].read().unwrap().get(s) {
+        let i = (fxh(s) as usize) & (ISHARD - 1);
+        {
+            let sh = self.shards[i].read().unwrap();
+            if let Some(&v) = sh.map.get(s) {
+                return v;
+            }
+        }
+        let mut sh = self.shards[i].write().unwrap();
+        if let Some(&v) = sh.map.get(s) {
             return v;
         }
-        let mut m = self.shards[i].write().unwrap();
-        if let Some(&v) = m.get(s) {
-            return v;
-        }
-        let v = {
-            let mut t = self.table.write().unwrap();
-            let v = t.len() as u32;
-            t.push(s.into());
-            v
-        };
-        m.insert(s.into(), v);
+        let v = (sh.tab.len() as u32) * (ISHARD as u32) + i as u32;
+        let b: Box<[u8]> = s.into();
+        sh.tab.push(b.clone());
+        sh.map.insert(b, v);
         v
     }
+    /// Per-shard table lengths (used to bound the link-phase ID space).
+    fn shard_lens(&self) -> Vec<u32> {
+        self.shards
+            .iter()
+            .map(|s| s.read().unwrap().tab.len() as u32)
+            .collect()
+    }
+    /// Consume the interner into lock-free per-shard tables for lookups by id.
+    fn freeze(self) -> Tab {
+        Tab {
+            tabs: self
+                .shards
+                .into_iter()
+                .map(|s| s.into_inner().unwrap().tab)
+                .collect(),
+        }
+    }
+}
+
+/// Frozen interner tables: `get(id)` resolves an interned id back to bytes.
+struct Tab {
+    tabs: Vec<Vec<Box<[u8]>>>,
+}
+impl Tab {
+    #[inline]
+    fn get(&self, id: u32) -> &[u8] {
+        &self.tabs[(id & ISHARD_MASK) as usize][(id >> 6) as usize]
+    }
+}
+
+/// Identity resolution result built after the links phase.
+/// `link_len[s]` = interned-id locals in shard s that came from links/.
+/// `person[id]` = canonical (lex-min) interned id of the id's component.
+/// Interned ids with local >= link_len are event/click-only uids (their own person).
+struct Persons {
+    link_len: Vec<u32>,
+    person: Vec<u32>,
+}
+impl Persons {
+    #[inline]
+    fn lookup(&self, id: u32) -> u32 {
+        let s = (id & ISHARD_MASK) as usize;
+        let l = (id >> 6) as usize;
+        if l < self.link_len[s] as usize {
+            self.person[id as usize]
+        } else {
+            id
+        }
+    }
+}
+
+/// Flatten per-task row vecs into N per-shard vecs. Each task is locally
+/// counting-sorted (flat + offsets), then shards gather slices in parallel —
+/// O(N) total, contiguous output, no per-bucket allocation churn.
+fn scatter<T: Copy + Send + Sync, const N: usize>(
+    tasks: &[Vec<T>],
+    fill: T,
+    shard: impl Fn(&T) -> usize + Sync,
+) -> Vec<Vec<T>> {
+    let sorted: Vec<(Vec<T>, Vec<u32>)> = tasks
+        .par_iter()
+        .map(|v| {
+            let mut c = vec![0u32; N];
+            for r in v {
+                c[shard(r)] += 1;
+            }
+            let mut offs = Vec::with_capacity(N + 1);
+            let mut acc = 0u32;
+            for s in 0..N {
+                offs.push(acc);
+                acc += c[s];
+            }
+            offs.push(acc);
+            let mut pos = offs.clone();
+            let mut flat = vec![fill; v.len()];
+            for r in v {
+                let s = shard(r);
+                flat[pos[s] as usize] = *r;
+                pos[s] += 1;
+            }
+            (flat, offs)
+        })
+        .collect();
+    (0..N)
+        .into_par_iter()
+        .map(|s| {
+            let n: usize = sorted.iter().map(|(_, o)| (o[s + 1] - o[s]) as usize).sum();
+            let mut v = Vec::with_capacity(n);
+            for (flat, offs) in &sorted {
+                v.extend_from_slice(&flat[offs[s] as usize..offs[s + 1] as usize]);
+            }
+            v
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -287,14 +399,31 @@ impl Interner {
 // ---------------------------------------------------------------------------
 #[derive(Clone, Copy)]
 struct RawEv {
+    eid_h: u64, // fxh(eid) — shard partitioning + dedup probing
     eid: BKey,
-    uid: BKey, // len==0 = empty (dropped at validate, after dedup)
+    uid: u32, // interned id, u32::MAX = empty (dropped at validate, after dedup)
     prod: BKey,
     ingest: i64,
     ts: i64,
     price: u32,
     etype: u8, // 0 view,1 cart,2 purchase,3 bad
     pflag: u8, // 0 null,1 ok,2 bad
+}
+impl RawEv {
+    #[inline]
+    fn empty() -> RawEv {
+        RawEv {
+            eid_h: 0,
+            eid: BKey::null(0),
+            uid: u32::MAX,
+            prod: BKey::null(0),
+            ingest: 0,
+            ts: 0,
+            price: 0,
+            etype: 0,
+            pflag: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -307,10 +436,23 @@ struct Ev {
 
 #[derive(Clone, Copy)]
 struct RawCl {
+    cid_h: u64,
     cid: BKey,
-    uid: BKey,
-    camp: BKey,
+    uid: u32,  // interned id, u32::MAX = empty
+    camp: u32, // campaign table index, u32::MAX = unknown
     ts: i64,
+}
+impl RawCl {
+    #[inline]
+    fn empty() -> RawCl {
+        RawCl {
+            cid_h: 0,
+            cid: BKey::null(0),
+            uid: u32::MAX,
+            camp: u32::MAX,
+            ts: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -725,27 +867,40 @@ fn main() {
             })
             .map(|(a, b)| (interner.intern(a), interner.intern(b)))
             .collect();
-        let l = interner.table.read().unwrap().len();
-        let mut uf = Uf::new(l);
+        // Partitioned id space: id = local*ISHARD + shard. UF is sized to
+        // cover every link-phase id; non-link interned ids are their own person.
+        let link_len = interner.shard_lens();
+        let n_ids = (link_len.iter().max().copied().unwrap_or(0) as usize + 1) * ISHARD;
+        let mut uf = Uf::new(n_ids);
         for (a, b) in pairs {
             uf.union(a, b);
         }
-        let tab = interner.table.read().unwrap();
+        // comp_min: lexicographically smallest interned id per component.
+        let guards: Vec<_> = interner.shards.iter().map(|s| s.read().unwrap()).collect();
+        let name = |id: u32| -> &[u8] {
+            &guards[(id & ISHARD_MASK) as usize].tab[(id >> 6) as usize]
+        };
         let mut comp_min: FxHashMap<u32, u32> = FxHashMap::default();
-        for s in 0..l as u32 {
-            let r = uf.find(s);
-            let e = comp_min.entry(r).or_insert(s);
-            if tab[s as usize][..] < tab[*e as usize][..] {
-                *e = s;
+        for s in 0..ISHARD {
+            for l in 0..link_len[s] {
+                let id = l * ISHARD as u32 + s as u32;
+                let r = uf.find(id);
+                let e = comp_min.entry(r).or_insert(id);
+                if name(id) < name(*e) {
+                    *e = id;
+                }
             }
         }
-        let mut person_of: Vec<u32> = vec![0; l];
-        for s in 0..l as u32 {
-            person_of[s as usize] = comp_min[&uf.find(s)];
+        let mut person = vec![0u32; n_ids];
+        for s in 0..ISHARD {
+            for l in 0..link_len[s] {
+                let id = l * ISHARD as u32 + s as u32;
+                person[id as usize] = comp_min[&uf.find(id)];
+            }
         }
-        PERSON_OF.set(person_of).ok();
+        drop(guards);
+        PERSONS.set(Persons { link_len, person }).ok();
     }
-    let nlink = interner.table.read().unwrap().len() as u32;
 
     // ---------------- events ----------------
     struct Task {
@@ -760,11 +915,11 @@ fn main() {
             tasks.push(Task { file: fi, cs, ce });
         }
     }
-    let task_buckets: Vec<Vec<Vec<RawEv>>> = tasks
+    let task_rows: Vec<Vec<RawEv>> = tasks
         .par_iter()
         .map(|t| {
             let b = buf(t.file);
-            let mut buckets: Vec<Vec<RawEv>> = (0..NSHARD).map(|_| Vec::new()).collect();
+            let mut rows: Vec<RawEv> = Vec::with_capacity((t.ce - t.cs) / 64);
             let mut pos = t.cs;
             let mut fields = [None; 8];
             if t.cs == 0 {
@@ -826,56 +981,67 @@ fn main() {
                         }
                     }
                 };
-                let row = RawEv {
+                let uid_slot = match uid {
+                    Some(u) => interner.intern(u),
+                    None => u32::MAX,
+                };
+                rows.push(RawEv {
+                    eid_h: fxh(eid),
                     eid: mk(Some(eid)),
-                    uid: mk(uid),
+                    uid: uid_slot,
                     prod: mk(prod),
                     ingest,
                     ts,
                     price: pv,
                     etype,
                     pflag,
-                };
-                let sh = (fxh(eid) as usize) & (NSHARD - 1);
-                buckets[sh].push(row);
+                });
             }
-            buckets
+            rows
         })
         .collect();
 
-    let shard_vecs: Vec<Vec<RawEv>> = (0..NSHARD)
-        .into_par_iter()
-        .map(|s| {
-            let mut v = Vec::new();
-            for tb in task_buckets.iter() {
-                v.extend_from_slice(&tb[s]);
-            }
-            v
-        })
-        .collect();
-    drop(task_buckets);
+    // counting-sort flatten into NSHARD shard vectors (contiguous, one alloc each)
+    let shard_vecs: Vec<Vec<RawEv>> = scatter::<RawEv, NSHARD>(&task_rows, RawEv::empty(), |r| {
+        (r.eid_h as usize) & (NSHARD - 1)
+    });
+    drop(task_rows);
 
-    let person_of: &'static Vec<u32> = PERSON_OF.get().unwrap();
+    let persons: &'static Persons = PERSONS.get().unwrap();
     let prod_map_ref = &prod_map;
     let evs: Vec<Ev> = shard_vecs
         .into_par_iter()
         .flat_map(|rows| {
-            let mut seen: FxHashMap<BKey, (i64, RawEv)> = FxHashMap::default();
-            for r in rows {
-                match seen.entry(r.eid) {
-                    std::collections::hash_map::Entry::Occupied(mut o) => {
-                        if r.ingest < o.get().0 {
-                            *o.get_mut() = (r.ingest, r);
+            // open-addressing dedup on event_id; keeps min-ingest copy (first wins ties)
+            let cap = (rows.len().max(16) * 2).next_power_of_two();
+            let mut state = vec![0u8; cap];
+            let mut keys = vec![BKey::null(0); cap];
+            let mut vals = vec![RawEv::empty(); cap];
+            for r in &rows {
+                let mut i = (r.eid_h as usize) & (cap - 1);
+                loop {
+                    if state[i] == 0 {
+                        state[i] = 1;
+                        keys[i] = r.eid;
+                        vals[i] = *r;
+                        break;
+                    }
+                    if keys[i] == r.eid {
+                        if r.ingest < vals[i].ingest {
+                            vals[i] = *r;
                         }
+                        break;
                     }
-                    std::collections::hash_map::Entry::Vacant(v) => {
-                        v.insert((r.ingest, r));
-                    }
+                    i = (i + 1) & (cap - 1);
                 }
             }
             let mut out = Vec::new();
-            for (_eid, (ingest, d)) in seen {
-                if d.uid.len == 0
+            for i in 0..cap {
+                if state[i] == 0 {
+                    continue;
+                }
+                let d = vals[i];
+                if d.uid == u32::MAX
                     || d.prod.len == 0
                     || d.etype == 3
                     || d.ts == T_INVALID
@@ -884,18 +1050,13 @@ fn main() {
                 {
                     continue;
                 }
-                if ingest - d.ts > D24 {
+                if d.ingest - d.ts > D24 {
                     continue;
                 }
                 if d.etype == 2 && d.pflag != 1 {
                     continue;
                 }
-                let slot = interner.intern(d.uid.get());
-                let person = if slot < nlink {
-                    person_of[slot as usize]
-                } else {
-                    slot
-                };
+                let person = persons.lookup(d.uid);
                 let (cat, price) = if d.etype == 2 {
                     (
                         prod_map_ref.get(d.prod.get()).copied().unwrap_or(unknown_cat),
@@ -926,11 +1087,12 @@ fn main() {
             ctasks.push(Task { file: fi, cs, ce });
         }
     }
-    let ctask_buckets: Vec<Vec<Vec<RawCl>>> = ctasks
+    let camp_map_ref = &camp_map;
+    let ctask_rows: Vec<Vec<RawCl>> = ctasks
         .par_iter()
         .map(|t| {
             let b = buf(t.file);
-            let mut buckets: Vec<Vec<RawCl>> = (0..NSHARD).map(|_| Vec::new()).collect();
+            let mut rows: Vec<RawCl> = Vec::with_capacity((t.ce - t.cs) / 48);
             let mut pos = t.cs;
             let mut fields = [None; 8];
             if t.cs == 0 {
@@ -962,57 +1124,67 @@ fn main() {
                     Some(x) => x,
                     None => continue, // empty click_id dropped at parse
                 };
-                let row = RawCl {
+                rows.push(RawCl {
+                    cid_h: fxh(cid),
                     cid: mk(Some(cid)),
-                    uid: mk(uid),
-                    camp: mk(camp),
+                    uid: match uid {
+                        Some(u) => interner.intern(u),
+                        None => u32::MAX,
+                    },
+                    camp: match camp {
+                        Some(c) => camp_map_ref.get(c).copied().unwrap_or(u32::MAX),
+                        None => u32::MAX,
+                    },
                     ts: ts_s.map(parse_ts).unwrap_or(T_INVALID),
-                };
-                let sh = (fxh(cid) as usize) & (NSHARD - 1);
-                buckets[sh].push(row);
+                });
             }
-            buckets
+            rows
         })
         .collect();
-    let cshard_vecs: Vec<Vec<RawCl>> = (0..NSHARD)
-        .into_par_iter()
-        .map(|s| {
-            let mut v = Vec::new();
-            for tb in ctask_buckets.iter() {
-                v.extend_from_slice(&tb[s]);
-            }
-            v
-        })
-        .collect();
-    drop(ctask_buckets);
+    let cshard_vecs: Vec<Vec<RawCl>> = scatter::<RawCl, NSHARD>(&ctask_rows, RawCl::empty(), |r| {
+        (r.cid_h as usize) & (NSHARD - 1)
+    });
+    drop(ctask_rows);
 
-    let camp_map_ref = &camp_map;
     let clicks: Vec<Cl> = cshard_vecs
         .into_par_iter()
         .flat_map(|rows| {
-            let mut seen: FxHashMap<BKey, RawCl> = FxHashMap::default();
-            for r in rows {
-                seen.entry(r.cid).or_insert(r);
+            // open-addressing dedup on click_id; first copy wins
+            let cap = (rows.len().max(16) * 2).next_power_of_two();
+            let mut state = vec![0u8; cap];
+            let mut keys = vec![BKey::null(0); cap];
+            let mut vals = vec![RawCl::empty(); cap];
+            for r in &rows {
+                let mut i = (r.cid_h as usize) & (cap - 1);
+                loop {
+                    if state[i] == 0 {
+                        state[i] = 1;
+                        keys[i] = r.cid;
+                        vals[i] = *r;
+                        break;
+                    }
+                    if keys[i] == r.cid {
+                        break;
+                    }
+                    i = (i + 1) & (cap - 1);
+                }
             }
             let mut out = Vec::new();
-            for (_cid, r) in seen {
-                if r.uid.len == 0 || r.ts == T_INVALID || r.ts < click_lo || r.ts >= we {
+            for i in 0..cap {
+                if state[i] == 0 {
                     continue;
                 }
-                let camp_idx = match camp_map_ref.get(r.camp.get()) {
-                    Some(&i) => i,
-                    None => continue,
-                };
-                let slot = interner.intern(r.uid.get());
-                let person = if slot < nlink {
-                    person_of[slot as usize]
-                } else {
-                    slot
-                };
+                let r = vals[i];
+                if r.uid == u32::MAX || r.ts == T_INVALID || r.ts < click_lo || r.ts >= we {
+                    continue;
+                }
+                if r.camp == u32::MAX {
+                    continue;
+                }
                 out.push(Cl {
-                    person,
+                    person: persons.lookup(r.uid),
                     ts: r.ts,
-                    camp: camp_idx,
+                    camp: r.camp,
                     cid: r.cid,
                 });
             }
@@ -1113,7 +1285,7 @@ fn main() {
         });
 
     // ---------------- outputs ----------------
-    let tab = interner.table.read().unwrap();
+    let tab = interner.freeze();
     let mut ud_rows: Vec<(u32, i64, u64, u64, i64, Option<u32>)> = Vec::new();
     for (k, a) in &total.ud {
         let person = (k >> 32) as u32;
@@ -1130,7 +1302,7 @@ fn main() {
         };
         ud_rows.push((person, day, a.sessions, a.events, a.rev, top));
     }
-    ud_rows.sort_by(|a, b| tab[a.0 as usize].cmp(&tab[b.0 as usize]).then(a.1.cmp(&b.1)));
+    ud_rows.sort_by(|a, b| tab.get(a.0).cmp(tab.get(b.0)).then(a.1.cmp(&b.1)));
 
     let mut cd_rows: Vec<(u32, i64, u64, u64, i64, u64)> = Vec::new();
     for (k, a) in &total.cd {
@@ -1172,7 +1344,7 @@ fn str_of(b: &[u8]) -> &str {
 fn write_user_parquet(
     dir: &Path,
     rows: &[(u32, i64, u64, u64, i64, Option<u32>)],
-    tab: &[Box<[u8]>],
+    tab: &Tab,
     cat_tab: &[Box<[u8]>],
 ) {
     let schema = Arc::new(Schema::new(vec![
@@ -1190,7 +1362,7 @@ fn write_user_parquet(
     let mut w = ArrowWriter::try_new(f, schema.clone(), Some(props)).unwrap();
     const CHUNK: usize = 2_000_000;
     for chunk in rows.chunks(CHUNK) {
-        let uid: Vec<&str> = chunk.iter().map(|r| str_of(&tab[r.0 as usize])).collect();
+        let uid: Vec<&str> = chunk.iter().map(|r| str_of(tab.get(r.0))).collect();
         let day: Vec<i32> = chunk.iter().map(|r| r.1 as i32).collect();
         let sess: Vec<i64> = chunk.iter().map(|r| r.2 as i64).collect();
         let ev: Vec<i64> = chunk.iter().map(|r| r.3 as i64).collect();
@@ -1286,7 +1458,7 @@ fn write_csvs(
     outdir: &Path,
     ud_rows: &[(u32, i64, u64, u64, i64, Option<u32>)],
     cd_rows: &[(u32, i64, u64, u64, i64, u64)],
-    tab: &[Box<[u8]>],
+    tab: &Tab,
     camp_names: &[Box<[u8]>],
     camp_chan: &[Box<[u8]>],
     cat_tab: &[Box<[u8]>],
@@ -1304,7 +1476,7 @@ fn write_csvs(
         writeln!(
             f,
             "{},{},{},{},{},{}",
-            str_of(&tab[r.0 as usize]),
+            str_of(tab.get(r.0)),
             fmt(r.1),
             r.2,
             r.3,

@@ -11,6 +11,7 @@ panic = "abort"
 
 [dependencies]
 memchr = "2"
+mimalloc = { version = "0.1", default-features = false }
 memmap2 = "0.9"
 rayon = "1.10"
 rustc-hash = "2"

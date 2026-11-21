@@ -10,7 +10,9 @@ RUN rustup target add x86_64-unknown-linux-musl \
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release --locked --target x86_64-unknown-linux-musl \
+# x86-64-v3 (AVX2/BMI2) — universal on modern Xeons; the scorer runs amd64.
+RUN RUSTFLAGS="-C target-cpu=x86-64-v3" \
+    cargo build --release --locked --target x86_64-unknown-linux-musl \
  && strip target/x86_64-unknown-linux-musl/release/shopping-sessions
 
 # ---- runtime stage: minimal image, static binary + shell for run.sh --------
