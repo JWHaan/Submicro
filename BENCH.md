@@ -103,3 +103,21 @@ numbers rank builds only. Authoritative: bench.yml x86 A/B + track score.
 - Phase evidence: head output_rows +73ms (snappy CPU) but total -43ms => exit-flush savings ~115ms > codec cost. Should scale up at 60M (output ~3x).
 - KEEP. Note: workflow's `cmp` parquet check flags DIFFERS whenever base/head codecs differ; CSV diff + pqcmp are the real gates.
 - x86 phase shape @20M NCPU=4 (from this run): ev_parse ~950ms, output_rows ~700ms, sessionize ~615ms, ev_dedup ~480ms, ev_sort ~255ms, cl_* ~620ms, links ~15ms. => prefetch canon_of dead (links trivial); next levers: hand-rolled parquet (output_rows), SIMD tokenizer (ev_parse), sessionize internals, fp dedup (ev_dedup).
+
+## parquet PLAIN encoding + no statistics — KEPT (~2.2%)
+- 3f9ad4a: WriterProperties -> Encoding::PLAIN + EnabledStatistics::None in both
+  writers. Defaults dictionary-encode every column (hash table per part per
+  column, ~2M distinct user_id strings) and compute min/max stats (full extra
+  column pass). Neither survives as a win vs snappy.
+- Gate: fixtures 36/36, dev parity, diff 5/5; pqcmp all 16 dev parts
+  semantically identical. Parquet bytes DIFFER (expected — different encoding).
+- x86 CI A/B run 44915112543 vs 9439a5f @20M NCPU=4: base 2746-2792ms (med
+  ~2756) -> head 2670-2755ms (med ~2694, ~2.2%, head wins 6/7).
+- Phase evidence: output_rows 514ms -> 469ms (-45ms, ~9% of phase) — the
+  dict+stats cost isolated. All other phases noise. KEEP.
+- Note: this run's machine was ~20% faster across the board than the last A/B
+  (runner CPU varies between runs — only compare within a run). At the last
+  run's CPU this is probably ~60-90ms.
+- output_rows still ~470-700ms depending on CPU: remaining fat is Arrow
+  RecordBatch materialization + parquet-rs encode pipeline => hand-rolled
+  writer is still the lever there.
