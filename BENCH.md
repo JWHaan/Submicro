@@ -81,3 +81,9 @@ numbers rank builds only. Authoritative: bench.yml x86 A/B + track score.
 - 11749be: Dockerfile gains synth training run — build synth, gen 3M events/750k clicks, instrumented -Cprofile-generate build, run inside build container, llvm-profdata merge, -Cprofile-use -Cprofile-correction rebuild (hansliu-dev recipe).
 - x86 CI A/B run 44908070010 vs be9c190 @20M NCPU=4: base 2898-3113ms (med ~3018) → head 2932-3166ms (med ~3007). Wash within noise; identical outputs. Competitors measured ~5%; not reproduced at 20M here.
 - KEEP as neutral: zero runtime cost, profile is real training data; plausible upside at 60M scale.
+
+## date-prefix cache in parse_ts — KEPT (~2.3%)
+- aa038e4: thread-local (u64,u16) -> day_ms cache on the 10-byte YYYY-MM-DD prefix; hits skip w0 SWAR check, month/leap/day validation, days_from_civil. HH:MM:SS + separators still verified per call (hit requires byte-identical prefix).
+- Gate: fixtures 36/36, dev CSV parity identical, diff 5/5 vs ref.py.
+- x86 CI A/B run 44908796491 vs a2f502c @20M NCPU=4: base 3339-3814ms (med ~3446) -> head 3344-3424ms (med ~3366, ~2.3%). All 7 head runs below base median; parquet byte-identical. KEEP.
+- Known caveat (corpus): single-entry caches miss ~93% on shuffled input (joch44 v10). Upgrade path: small day-indexed table if hidden data proves unordered.
