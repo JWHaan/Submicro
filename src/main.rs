@@ -1067,7 +1067,7 @@ fn main() {
     pt!("catalogs");
 
     // links -> union-find over u64 keys -> canon map
-    let canon_map: U64Map = {
+    let canon_map = {
         let link_tasks: Vec<(u16, usize, usize)> = (ncl..nln)
             .flat_map(|fi| {
                 line_chunks(buf(fi as u16), ncpu * 2)
@@ -1126,13 +1126,25 @@ fn main() {
             }
         }
         let mut m = U64Map::new(n_ids);
+        let bmask = (n_ids * 8).max(1 << 16).next_power_of_two() - 1;
+        let mut bloom = vec![0u64; (bmask + 1) / 64];
         for i in 0..n_ids as u32 {
+            let k = keys[i as usize];
             let canon = keys[comp_min[&uf.find(i)] as usize];
-            m.insert(keys[i as usize], canon);
+            m.insert(k, canon);
+            let bi = (fx64(k) as usize) & bmask;
+            bloom[bi >> 6] |= 1 << (bi & 63);
         }
-        m
+        (m, bloom, bmask)
     };
-    let canon_of = |k: u64| -> u64 { canon_map.get(k).unwrap_or(k) };
+    let (canon_map, cbloom, cbmask) = canon_map;
+    let canon_of = |k: u64| -> u64 {
+        let h = fx64(k) as usize;
+        if cbloom[(h & cbmask) >> 6] >> (h & 63) & 1 == 0 {
+            return k;
+        }
+        canon_map.get(k).unwrap_or(k)
+    };
     pt!("links");
 
     // ---------------- events ----------------
