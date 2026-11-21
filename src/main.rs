@@ -1577,8 +1577,45 @@ fn main() {
 
     // ---------------- sessionize + attribute ----------------
     let ev_runs = person_runs(&evs, |e| e.person);
-    let mut cl_runs = person_runs(&clicks, |c| c.person);
-    cl_runs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let cl_runs = person_runs(&clicks, |c| c.person);
+    // both arenas are grouped by fx64(person)&255 shards; per-shard merge join
+    // maps each event-run to its click-run without any binary search
+    let mut ev_bounds = [0u32; NSHARD + 1];
+    for r in &ev_runs {
+        ev_bounds[((fx64(r.0) as usize) & (NSHARD - 1)) + 1] += 1;
+    }
+    for i in 0..NSHARD {
+        ev_bounds[i + 1] += ev_bounds[i];
+    }
+    let mut cl_bounds = [0u32; NSHARD + 1];
+    for r in &cl_runs {
+        cl_bounds[((fx64(r.0) as usize) & (NSHARD - 1)) + 1] += 1;
+    }
+    for i in 0..NSHARD {
+        cl_bounds[i + 1] += cl_bounds[i];
+    }
+    let cl_idx: Vec<u32> = {
+        let mut v = vec![u32::MAX; ev_runs.len()];
+        let p = RawPtr::<u32>(v.as_mut_ptr() as usize, std::marker::PhantomData);
+        let (evr, clr) = (&ev_runs, &cl_runs);
+        (0..NSHARD).into_par_iter().for_each(|s| {
+            let (mut i, mut j) = (ev_bounds[s] as usize, cl_bounds[s] as usize);
+            let (ie, je) = (ev_bounds[s + 1] as usize, cl_bounds[s + 1] as usize);
+            while i < ie && j < je {
+                let (ep, cp) = (evr[i].0, clr[j].0);
+                if ep < cp {
+                    i += 1;
+                } else if cp < ep {
+                    j += 1;
+                } else {
+                    unsafe { *(p.0 as *mut u32).add(i) = j as u32 };
+                    i += 1;
+                    j += 1;
+                }
+            }
+        });
+        v
+    };
 
     let day_lo = ws / D24;
     let n_days = ((we - 1) / D24 - day_lo + 1) as usize;
@@ -1586,18 +1623,20 @@ fn main() {
     let cat_tab_ref = &cat_tab;
     let total = ev_runs
         .par_iter()
+        .enumerate()
         .with_min_len(1 << 16)
         .fold(
             || Acc::new(n_days, n_camps, day_lo),
-            |mut acc, &(person, lo, hi)| {
+            |mut acc, (ri, &(person, lo, hi))| {
                 acc.sessions.clear();
                 acc.ats.clear();
                 acc.acamp.clear();
                 acc.cts.clear();
                 acc.ccamp.clear();
                 acc.alive.reset();
-                if let Ok(ri) = cl_runs.binary_search_by(|r| r.0.cmp(&person)) {
-                    let (_, clo, chi) = cl_runs[ri];
+                let ci = cl_idx[ri];
+                if ci != u32::MAX {
+                    let (_, clo, chi) = cl_runs[ci as usize];
                     for c in &clicks[clo as usize..chi as usize] {
                         acc.ats.push(c.ts);
                         acc.acamp.push(c.camp);
