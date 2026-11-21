@@ -20,8 +20,8 @@ type CampRow = (u32, i64, u64, u64, i64, u64);
 // properties. One binary suffices for interleaved runs of all three modes.
 pub(super) fn selected_codec() -> Option<Codec> {
     match std::env::var("PARQUET_WRITER").as_deref() {
-        Err(std::env::VarError::NotPresent) | Ok("snappy") => Some(Codec::SNAPPY),
-        Ok("uncompressed") => Some(Codec::UNCOMPRESSED),
+        Err(std::env::VarError::NotPresent) | Ok("uncompressed") => Some(Codec::UNCOMPRESSED),
+        Ok("snappy") => Some(Codec::SNAPPY),
         Ok("arrow") => None,
         _ => panic!("expected PARQUET_WRITER=snappy|uncompressed|arrow"),
     }
