@@ -25,6 +25,14 @@ mod plain_writer;
 mod scanner;
 use scanner::each_line;
 
+#[cfg(target_os = "linux")]
+mod large_alloc;
+
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: large_alloc::Hybrid = large_alloc::Hybrid::new();
+
+#[cfg(not(target_os = "linux"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -1867,15 +1875,17 @@ fn main() {
     }
     pt!("write");
     if std::env::var_os("NO_TEARDOWN").is_none() {
-        let mut regions: Vec<(usize, usize)> = Vec::new();
-        reg_buf(&mut regions, &evs);
-        reg_buf(&mut regions, &clicks);
-        reg_buf(&mut regions, &total.ud_out);
-        reg_buf(&mut regions, &total.cd);
-        reg_buf(&mut regions, &ud_rows);
-        reg_buf(&mut regions, &cd_rows);
-        reg_buf(&mut regions, &ud_groups);
-        parallel_teardown(&regions);
+        // Transfer ownership rather than discarding pages behind a live Vec.
+        // Each deallocator sees exactly the allocation it handed out.
+        rayon::scope(|s| {
+            s.spawn(move |_| drop(evs));
+            s.spawn(move |_| drop(clicks));
+            s.spawn(move |_| drop(total.ud_out));
+            s.spawn(move |_| drop(total.cd));
+            s.spawn(move |_| drop(ud_rows));
+            s.spawn(move |_| drop(cd_rows));
+            s.spawn(move |_| drop(ud_groups));
+        });
     }
     std::process::exit(0);
 }
@@ -1954,38 +1964,6 @@ fn group_sort<T: Copy>(
     }
     sl.copy_from_slice(&tmp);
 }
-
-fn reg_buf<T>(out: &mut Vec<(usize, usize)>, v: &Vec<T>) {
-    let n = v.capacity().saturating_mul(std::mem::size_of::<T>());
-    if n >= (1 << 20) {
-        out.push((v.as_ptr() as usize, n));
-    }
-}
-
-/// Discard interior pages of our own dead buffers across all threads so the
-/// kernel's serial VMA teardown at exit has nothing left to zap. Only pages
-/// fully inside each buffer are touched: malloc chunk headers/footers and
-/// neighboring allocations stay intact. Set NO_TEARDOWN to skip.
-#[cfg(unix)]
-fn parallel_teardown(regions: &[(usize, usize)]) {
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    for &(s, n) in regions {
-        let s0 = (s + 4095) & !4095usize;
-        let e0 = (s + n) & !4095usize;
-        let mut p = s0;
-        while p < e0 {
-            let q = std::cmp::min(p + (64 << 20), e0);
-            spans.push((p, q));
-            p = q;
-        }
-    }
-    spans.par_iter().for_each(|&(s, e)| unsafe {
-        libc::madvise(s as *mut _, e - s, libc::MADV_DONTNEED);
-    });
-}
-
-#[cfg(not(unix))]
-fn parallel_teardown(_regions: &[(usize, usize)]) {}
 
 fn str_of(b: &[u8]) -> &str {
     unsafe { std::str::from_utf8_unchecked(b) }

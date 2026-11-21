@@ -150,3 +150,17 @@ Native: 12 Rust tests passed; 36 fixtures, current dev answers and 37
 differential datasets matched both tables in default Parquet and debug CSV.
 Timing gate: compare against `656589b` in a seven-pair 20M amd64 container
 run when the next benchmark slot opens. No speedup or scorer time claimed.
+
+## WS-C owned large mappings, rebased onto `52de18e` — gate pending
+- Originally `0942d28` on `73dd703`, now cherry-picked onto the epoch-swar tip.
+  Linux allocations >=1 MiB use private anonymous mappings with a best-effort
+  THP hint. Exact power-of-two dead mappings from 1 through 32 MiB have one
+  reuse slot each (at most 63 MiB cached). Small allocations stay with
+  mimalloc. At exit, drop owned buffers rather than advising pages through
+  still-live vectors. Advisory `MAP_NORESERVE` included.
+- Merge resolution kept the SIMD scanner, plain writer, group-sort and
+  cid_bytes helpers; removed reg_buf/parallel_teardown per the Hybrid design.
+- Prior evidence (from the `73dd703` experiment): Linux allocator tests 3/3,
+  Linux/arm64 dev CSV multiset + Parquet matched mimalloc. Needs a fresh
+  native gate on this lineage plus an amd64 timing comparison vs `52de18e`.
+  No speedup claim until then.
