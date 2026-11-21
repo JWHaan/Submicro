@@ -19,8 +19,8 @@ use rustc_hash::{FxHashMap, FxHasher};
 use arrow_array::{Date32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
+use parquet::basic::{Compression, Encoding};
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -1976,6 +1976,8 @@ fn write_user_part(
     let f = fs::File::create(dir.join(format!("part-{}.parquet", part))).unwrap();
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
+        .set_encoding(Encoding::PLAIN)
+        .set_statistics_enabled(EnabledStatistics::None)
         .build();
     let mut w = ArrowWriter::try_new(f, schema.clone(), Some(props)).unwrap();
     const CHUNK: usize = 2_000_000;
@@ -2090,6 +2092,8 @@ fn write_camp_part(
     let f = fs::File::create(dir.join(format!("part-{}.parquet", part))).unwrap();
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
+        .set_encoding(Encoding::PLAIN)
+        .set_statistics_enabled(EnabledStatistics::None)
         .build();
     let mut w = ArrowWriter::try_new(f, schema.clone(), Some(props)).unwrap();
     const CHUNK: usize = 2_000_000;
