@@ -1,0 +1,19 @@
+[package]
+name = "shopping-sessions"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[dependencies]
+memchr = "2"
+memmap2 = "0.9"
+rayon = "1.10"
+rustc-hash = "2"
+parquet = { version = "56", default-features = false, features = ["arrow"] }
+arrow-array = "56"
+arrow-schema = "56"
