@@ -137,3 +137,41 @@ numbers rank builds only. Authoritative: bench.yml x86 A/B + track score.
   schema-matching empty part per table in each mode.
 - No performance result or keep decision yet. Full fixtures, official dev
   answer, differential oracle and paired x86 timings are coordinator gates.
+
+## Direct clicks: reject; keep `656589b`
+
+Candidate `5ab39a4e8516a58e99a7365ca821c2fa5a588380` vs parent
+`656589bdd40125520539e9ca608fdac303ac9092`. Based on the [click dedup
+decision in kaedeng/shopping-sessions](https://github.com/kaedeng/shopping-sessions/blob/5d30aa678f4f76c8c51a6f4bff9028e5e86f84b9/decisions.md):
+rule C2 guarantees identical values; neither last-touch credit nor per-session
+campaign presence depends on copy count. Instead of hashing IDs and scattering
+copies, filter immediately, resolve each person and carry a borrowed ID for ties.
+Event arbitration is unchanged.
+
+| Input / host (4 vCPU) | Parent median | Candidate median | Paired wins | Cgroup peak (base/head, bytes) |
+| --- | ---: | ---: | ---: | ---: |
+| [20M events / 5M clicks, Intel 6975P-C](https://github.com/JWHaan/Submicro/actions/runs/45000827458) | 2460.9 ms | 2499.1 ms (+1.55%) | 0/7 | 2338447360 / 2348933120 |
+| [60M events / 15M clicks, AMD EPYC 9V74](https://github.com/JWHaan/Submicro/actions/runs/45000830443) | 7867.4 ms | 8137.1 ms (+3.43%) | 0/7 | 6954430464 / 7031590912 |
+
+- Full `linux/amd64` musl images, `-C target-cpu=x86-64-v3`, `--memory=12g`,
+  seeds 20017/60017 of the pinned variable-width generator. One warmup per
+  image then seven alternating pairs. Schema/row and resource traces untimed.
+- Raw wall ms (pair order, rounded): 20M base [2484,2438,2456,2469,2486,2452,2461],
+  head [2562,2490,2463,2515,2522,2495,2499]; 60M base [7813,7867,7739,7944,7804,7887,7946],
+  head [8137,8082,8136,8203,8108,8502,8505].
+- Untimed traces: total click parse/scatter/dedup/filter/sort 405 -> 422 ms at
+  20M and 1214 -> 1491 ms at 60M. New parse includes lookup and filtering;
+  its individual timing is not comparable to old parse alone. Head event
+  parse was 823 / 2536 ms, the largest remaining phase.
+- Native: candidate and parent matched 36 fixtures, the updated 1M dev answer,
+  and 37 differential datasets in both debug CSV and default decoded Parquet.
+  An additional candidate check repeated three tied click IDs across four
+  files (24k copies), with different quoting, linked users and a seven-day
+  expiry: oracle MATCH. `2b5038e` separately passed fixtures, dev and 33
+  differential cases. No oracle changes.
+- Both amd64 jobs passed fixtures and dev (118107 user rows / 27449 campaign
+  rows). Parent vs head decoded Parquet MATCH with no duplicate keys at 20M
+  (2221549 / 28014) and 60M (6613069 / 28014). No scorer submission.
+- Earlier run [44987077164](https://github.com/JWHaan/Submicro/actions/runs/44987077164)
+  (2642.2 -> 2499.8 ms) compared `50d7121` to `656589b` at **20M**;
+  it was not the scanner/writer vs master result or a 60M measurement.
