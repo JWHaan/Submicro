@@ -1049,35 +1049,36 @@ fn main() {
                 out
             })
             .collect();
-        // dense ids for UF via open map
-        let mut idmap: FxHashMap<u64, u32> = FxHashMap::default();
-        let mut keys: Vec<u64> = Vec::new();
-        let idx_of = |k: u64, idmap: &mut FxHashMap<u64, u32>, keys: &mut Vec<u64>| -> u32 {
-            if let Some(&i) = idmap.get(&k) {
-                return i;
+        // dense ids for UF via a flat open map (pairs never hold key 0)
+        let mut idmap = U64Map::new(pairs.len() + 16);
+        let mut keys: Vec<u64> = Vec::with_capacity(pairs.len() + 16);
+        let mut idx_of = |k: u64| -> u32 {
+            if let Some(i) = idmap.get(k) {
+                return i as u32;
             }
             let i = keys.len() as u32;
             keys.push(k);
-            idmap.insert(k, i);
+            idmap.insert(k, i as u64);
             i
         };
-        let mut pairs2: Vec<(u32, u32)> = Vec::with_capacity(pairs.len());
-        for (a, b) in pairs {
-            let ia = idx_of(a, &mut idmap, &mut keys);
-            let ib = idx_of(b, &mut idmap, &mut keys);
-            pairs2.push((ia, ib));
+        let mut uf_pairs: Vec<(u32, u32)> = Vec::with_capacity(pairs.len());
+        for &(a, b) in &pairs {
+            uf_pairs.push((idx_of(a), idx_of(b)));
         }
+        drop(pairs);
         let n_ids = keys.len();
         let mut uf = Uf::new(n_ids);
-        for (a, b) in pairs2 {
+        for (a, b) in uf_pairs {
             uf.union(a, b);
         }
-        // canonical member = byte-min key in component
-        let mut comp_min: FxHashMap<u32, u32> = FxHashMap::default();
+        // canonical member = byte-min key in component (flat, one find per id)
+        let roots: Vec<u32> = (0..n_ids as u32).map(|i| uf.find(i)).collect();
+        let mut comp_min: Vec<u32> = vec![u32::MAX; n_ids];
         for i in 0..n_ids as u32 {
-            let r = uf.find(i);
-            let e = comp_min.entry(r).or_insert(i);
-            if key_cmp(keys[i as usize], keys[*e as usize]) == std::cmp::Ordering::Less {
+            let e = &mut comp_min[roots[i as usize] as usize];
+            if *e == u32::MAX
+                || key_cmp(keys[i as usize], keys[*e as usize]) == std::cmp::Ordering::Less
+            {
                 *e = i;
             }
         }
@@ -1086,7 +1087,7 @@ fn main() {
         let mut bloom = vec![0u64; (bmask + 1) / 64];
         for i in 0..n_ids as u32 {
             let k = keys[i as usize];
-            let canon = keys[comp_min[&uf.find(i)] as usize];
+            let canon = keys[comp_min[roots[i as usize] as usize] as usize];
             m.insert(k, canon);
             let bi = (fx64(k) as usize) & bmask;
             bloom[bi >> 6] |= 1 << (bi & 63);
