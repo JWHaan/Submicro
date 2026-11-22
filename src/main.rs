@@ -402,6 +402,30 @@ fn swar_digits(w: u64) -> bool {
     (w & HI) == D3 && (w.wrapping_add(0x0606060606060606) & HI) == D3
 }
 
+/// Reduce eight validated digit lanes (low byte first) in three stages.
+#[inline(always)]
+fn decode8(w: u64) -> i64 {
+    let d = w & 0x0f0f_0f0f_0f0f_0f0f;
+    let pairs = (d * 10 + (d >> 8)) & 0x00ff_00ff_00ff_00ff;
+    let quads = (pairs * 100 + (pairs >> 16)) & 0x0000_ffff_0000_ffff;
+    (quads as u32 as i64) * 10_000 + (quads >> 32) as i64
+}
+
+fn epoch_ms(s: &[u8]) -> i64 {
+    let n = s.len();
+    if (9..=16).contains(&n) {
+        // Two possibly overlapping in-bounds loads cover every input byte.
+        // Shift the first n-8 digits into the high lanes, padding with zero.
+        let hi = u64::from_le_bytes(s[..8].try_into().unwrap());
+        let lo = u64::from_le_bytes(s[n - 8..].try_into().unwrap());
+        if swar_digits(hi) && swar_digits(lo) {
+            return decode8(hi << ((16 - n) * 8)) * 100_000_000 + decode8(lo);
+        }
+        return T_INVALID;
+    }
+    if is_digits(s) { atoi(s) } else { T_INVALID }
+}
+
 thread_local! {
     /// (s[0..8] as u64, s[8..10] as u16) -> day epoch ms, direct-mapped by
     /// day of month, so `ts`/`ingest_ts` and a multi-week window coexist.
@@ -411,15 +435,8 @@ thread_local! {
 
 /// Epoch ms, or T_INVALID on any violation. Same strictness as the reference.
 fn parse_ts(s: &[u8]) -> i64 {
-    if s.is_empty() {
-        return T_INVALID;
-    }
-    if is_digits(s) {
-        let mut v: i64 = 0;
-        for &c in s {
-            v = v.saturating_mul(10).saturating_add((c - b'0') as i64);
-        }
-        return v;
+    if s.get(10) != Some(&b'T') {
+        return epoch_ms(s);
     }
     let n = s.len();
     let off_ms = if n == 20 && s[19] == b'Z' {
@@ -501,6 +518,30 @@ fn parse_ts(s: &[u8]) -> i64 {
         return T_INVALID;
     }
     day_ms + (h * 3600 + mi * 60 + sec) * 1000 - off_ms
+}
+
+#[cfg(test)]
+mod epoch_tests {
+    use super::*;
+
+    #[test]
+    fn numeric_widths_and_every_malformed_lane() {
+        for n in 0..=33 {
+            let mut s: Vec<_> = b"0182375496".iter().copied().cycle().take(n).collect();
+            let expected = if n == 0 { T_INVALID } else { atoi(&s) };
+            assert_eq!(parse_ts(&s), expected);
+            for i in 0..n {
+                let saved = s[i];
+                for bad in [0, b'/', b':', b'T', 0xff] {
+                    s[i] = bad;
+                    assert_eq!(parse_ts(&s), T_INVALID);
+                }
+                s[i] = saved;
+            }
+        }
+        assert_eq!(parse_ts(b"00000000000000000000000001"), 1);
+        assert_eq!(parse_ts(b"9999999999999999"), 9_999_999_999_999_999);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -137,3 +137,16 @@ numbers rank builds only. Authoritative: bench.yml x86 A/B + track score.
   schema-matching empty part per table in each mode.
 - No performance result or keep decision yet. Full fixtures, official dev
   answer, differential oracle and paired x86 timings are coordinator gates.
+
+## Numeric timestamp decoding: awaiting amd64 A/B
+
+Runtime base `656589bdd40125520539e9ca608fdac303ac9092`, not the rejected
+direct-clicks variant. Experiment: distinguish ISO from numeric timestamps
+using byte 10, then validate and decode 9-16 digit epoch values in two
+overlapping 8-byte loads. Other widths retain the scalar overflow behavior.
+No change to records, ID handling, date validation, or timestamp windows.
+
+Native: 12 Rust tests passed; 36 fixtures, current dev answers and 37
+differential datasets matched both tables in default Parquet and debug CSV.
+Timing gate: compare against `656589b` in a seven-pair 20M amd64 container
+run when the next benchmark slot opens. No speedup or scorer time claimed.
