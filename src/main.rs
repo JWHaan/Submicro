@@ -385,8 +385,10 @@ fn swar_digits(w: u64) -> bool {
 }
 
 thread_local! {
-    /// (s[0..8] as u64, s[8..10] as u16) -> day epoch ms. Last seen "YYYY-MM-DD".
-    static TS_CACHE: Cell<(u64, u16, i64)> = const { Cell::new((0, 0, T_INVALID)) };
+    /// (s[0..8] as u64, s[8..10] as u16) -> day epoch ms, direct-mapped by
+    /// day of month, so `ts`/`ingest_ts` and a multi-week window coexist.
+    static TS_CACHE: [Cell<(u64, u16, i64)>; 32] =
+        const { [const { Cell::new((0, 0, T_INVALID)) }; 32] };
 }
 
 /// Epoch ms, or T_INVALID on any violation. Same strictness as the reference.
@@ -436,7 +438,8 @@ fn parse_ts(s: &[u8]) -> i64 {
     // month/leap/day validation, and days_from_civil.
     let k0 = u64::from_le_bytes(s[0..8].try_into().unwrap());
     let k1 = u16::from_le_bytes(s[8..10].try_into().unwrap());
-    let day_ms = match TS_CACHE.with(|c| c.get()) {
+    let slot = (s[8].wrapping_sub(b'0') as usize * 10 + s[9].wrapping_sub(b'0') as usize) & 31;
+    let day_ms = match TS_CACHE.with(|c| c[slot].get()) {
         (ck0, ck1, ms) if ck0 == k0 && ck1 == k1 => ms,
         _ => {
             let w0 = u64::from_le_bytes(s[0..8].try_into().unwrap());
@@ -460,7 +463,7 @@ fn parse_ts(s: &[u8]) -> i64 {
                 return T_INVALID;
             }
             let ms = days_from_civil(y, mo, d) * 86400000;
-            TS_CACHE.with(|c| c.set((k0, k1, ms)));
+            TS_CACHE.with(|c| c[slot].set((k0, k1, ms)));
             ms
         }
     };
