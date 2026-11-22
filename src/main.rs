@@ -120,6 +120,18 @@ fn fx64(k: u64) -> u64 {
     h ^ (h >> 33)
 }
 
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0)
+    };
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags))
+    };
+}
+
 /// Flat open-addressing u64->u64 map (key 0 = empty). One cache line per probe.
 struct U64Map {
     keys: Vec<u64>,
@@ -175,6 +187,12 @@ impl U64Map {
             }
             s = (s + 1) & self.mask;
         }
+    }
+    #[inline(always)]
+    fn prefetch(&self, k: u64) {
+        let s = (fx64(k) as usize) & self.mask;
+        prefetch(unsafe { self.keys.as_ptr().add(s) });
+        prefetch(unsafe { self.vals.as_ptr().add(s) });
     }
     #[inline]
     fn get(&self, k: u64) -> Option<u64> {
@@ -1102,6 +1120,12 @@ fn main() {
         (m, bloom, bmask)
     };
     let (canon_map, cbloom, cbmask) = canon_map;
+    let canon_prefetch = |k: u64| {
+        let h = fx64(k) as usize;
+        if cbloom[(h & cbmask) >> 6] >> (h & 63) & 1 != 0 {
+            canon_map.prefetch(k);
+        }
+    };
     let canon_of = |k: u64| -> u64 {
         let h = fx64(k) as usize;
         if cbloom[(h & cbmask) >> 6] >> (h & 63) & 1 == 0 {
@@ -1305,7 +1329,11 @@ fn main() {
             let g0 = tbase_ref[t] as usize;
             let mut out = Vec::with_capacity(rows.len());
             let mut cnt = vec![0u32; NSHARD];
+            const AHEAD: usize = 8;
             for (j, d) in rows.iter().enumerate() {
+                if let Some(a) = rows.get(j + AHEAD) {
+                    canon_prefetch(a.uid);
+                }
                 if kept_ref[g0 + j].load(Ordering::Relaxed) == 0 {
                     continue;
                 }
