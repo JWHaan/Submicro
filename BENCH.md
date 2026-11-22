@@ -150,3 +150,13 @@ Native: 12 Rust tests passed; 36 fixtures, current dev answers and 37
 differential datasets matched both tables in default Parquet and debug CSV.
 Timing gate: compare against `656589b` in a seven-pair 20M amd64 container
 run when the next benchmark slot opens. No speedup or scorer time claimed.
+
+## exp/sub1-whale — REJECTED (official scorer)
+
+| Commit | Base | Official score | Baseline | Delta |
+|---|---|---|---|---|
+| ef06b7a | 52de18e | 2.0450 s | 1.9165 s | +0.1285 s regression |
+
+Largest-first sessionize scheduling: extra `run_order` indirection + bucket pass
+cost more than tail-chunk savings. Person run sizes are likely uniform enough
+that there are no whales worth prioritizing.
