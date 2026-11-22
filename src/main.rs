@@ -1670,13 +1670,21 @@ fn main() {
     let n_days = ((we - 1) / D24 - day_lo + 1) as usize;
     let nslots = n_camps as usize + 1;
     let cat_tab_ref = &cat_tab;
-    let total = ev_runs
+    // largest-first: whales start immediately instead of stranding in the
+    // tail of the work-stolen schedule (bucket by bit-length, not a sort).
+    let mut lbuckets: [Vec<u32>; 33] = std::array::from_fn(|_| Vec::new());
+    for (i, &(_, lo, hi)) in ev_runs.iter().enumerate() {
+        lbuckets[(hi - lo).leading_zeros() as usize].push(i as u32);
+    }
+    let run_order: Vec<u32> = lbuckets.iter().flatten().copied().collect();
+    let total = run_order
         .par_iter()
-        .enumerate()
         .with_min_len(1 << 16)
         .fold(
             || Acc::new(n_days, n_camps, day_lo),
-            |mut acc, (ri, &(person, lo, hi))| {
+            |mut acc, &ori| {
+                let ri = ori as usize;
+                let &(person, lo, hi) = &ev_runs[ri];
                 acc.sessions.clear();
                 acc.ats.clear();
                 acc.acamp.clear();
