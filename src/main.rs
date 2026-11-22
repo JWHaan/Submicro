@@ -5,16 +5,15 @@ use std::cell::Cell;
 use std::cmp::{max, min};
 use std::env;
 use std::fs;
-use std::hash::Hasher;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use memchr::{memchr, memmem};
 use memmap2::Mmap;
 use rayon::prelude::*;
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::FxHashMap;
 
 use arrow_array::{Date32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -49,7 +48,7 @@ fn buf(f: u16) -> &'static [u8] {
 // ---------------------------------------------------------------------------
 // Packed keys: [0-9A-Za-z_] x <=10 chars -> u64, 6 bits/char, left-aligned.
 // Byte order is preserved among packed keys. key==0 is the empty sentinel.
-// Longer/other ids -> fallback interner, key = FB_TAG | (local*64 + shard).
+// Longer/other ids -> fallback interner, key = FB_TAG | (local << 10 | shard).
 // ---------------------------------------------------------------------------
 #[inline]
 const fn build_pack_tab() -> [u8; 256] {
@@ -115,12 +114,6 @@ fn unpack(k: u64, out: &mut [u8; 10]) -> usize {
 fn fx64(k: u64) -> u64 {
     let h = k.wrapping_mul(0x9E3779B97F4A7C15);
     h ^ (h >> 33)
-}
-
-fn fxh(s: &[u8]) -> u64 {
-    let mut h = FxHasher::default();
-    h.write(s);
-    h.finish()
 }
 
 /// Flat open-addressing u64->u64 map (key 0 = empty). One cache line per probe.
@@ -195,55 +188,104 @@ impl U64Map {
     }
 }
 
-// Fallback interner: 64 shards, id = local*64 + shard (mirrors key tag layout).
+// Fallback interner for ids that do not pack into 60 bits.
+// Every id handed to `key_of` is a slice of a memory-mapped input file that
+// stays mapped until exit, so the table stores those slices directly: no
+// allocation per id. 1024 cache-line-padded shards, one lock per lookup,
+// open addressing on (32-bit hash tag | local id + 1).
+// key = FB_TAG | (local << FB_SHIFT) | shard.
+const FB_SHIFT: u32 = 10;
+const FB_NSH: usize = 1 << FB_SHIFT;
+const FB_LOCAL_MASK: u64 = (1u64 << 50) - 1;
+
+#[inline]
+fn hbytes(s: &[u8]) -> u64 {
+    const M: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut h = (s.len() as u64).wrapping_mul(M);
+    let mut c = s.chunks_exact(8);
+    for w in &mut c {
+        h = (h ^ u64::from_le_bytes(w.try_into().unwrap())).wrapping_mul(M).rotate_left(31);
+    }
+    let r = c.remainder();
+    if !r.is_empty() {
+        let mut t = [0u8; 8];
+        t[..r.len()].copy_from_slice(r);
+        h = (h ^ u64::from_le_bytes(t)).wrapping_mul(M).rotate_left(31);
+    }
+    h ^= h >> 29;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^ (h >> 32)
+}
+
 struct FbShard {
-    map: FxHashMap<Box<[u8]>, u32>,
-    tab: Vec<Box<[u8]>>,
+    slots: Vec<u64>,
+    tab: Vec<&'static [u8]>,
 }
+#[repr(align(128))]
+struct FbPad(Mutex<FbShard>);
 struct Fb {
-    shards: Vec<RwLock<FbShard>>,
+    shards: Vec<FbPad>,
 }
-const ISHARD: usize = 64;
-const ISHARD_MASK: u64 = (ISHARD - 1) as u64;
+impl FbShard {
+    #[inline]
+    fn find_or_insert(&mut self, s: &'static [u8], h: u64) -> u64 {
+        let tag = h >> 32;
+        let mut mask = self.slots.len() - 1;
+        let mut p = (h >> FB_SHIFT) as usize & mask;
+        loop {
+            let v = self.slots[p];
+            if v == 0 {
+                break;
+            }
+            if v >> 32 == tag && self.tab[(v as u32 - 1) as usize] == s {
+                return (v as u32 - 1) as u64;
+            }
+            p = (p + 1) & mask;
+        }
+        let id = self.tab.len() as u64;
+        self.tab.push(s);
+        self.slots[p] = (tag << 32) | (id + 1);
+        if self.tab.len() * 4 > self.slots.len() * 3 {
+            let mut ns = vec![0u64; self.slots.len() * 2];
+            mask = ns.len() - 1;
+            for (i, t) in self.tab.iter().enumerate() {
+                let hh = hbytes(t);
+                let mut q = (hh >> FB_SHIFT) as usize & mask;
+                while ns[q] != 0 {
+                    q = (q + 1) & mask;
+                }
+                ns[q] = ((hh >> 32) << 32) | (i as u64 + 1);
+            }
+            self.slots = ns;
+        }
+        id
+    }
+}
 impl Fb {
     fn new() -> Self {
         Fb {
-            shards: (0..ISHARD)
+            shards: (0..FB_NSH)
                 .map(|_| {
-                    RwLock::new(FbShard {
-                        map: FxHashMap::default(),
+                    FbPad(Mutex::new(FbShard {
+                        slots: vec![0; 1024],
                         tab: Vec::new(),
-                    })
+                    }))
                 })
                 .collect(),
         }
     }
     #[inline]
-    fn intern(&self, s: &[u8]) -> u64 {
-        let i = (fxh(s) as usize) & (ISHARD - 1);
-        {
-            let sh = self.shards[i].read().unwrap();
-            if let Some(&v) = sh.map.get(s) {
-                return FB_TAG | ((v as u64) << 6) | i as u64;
-            }
-        }
-        let mut sh = self.shards[i].write().unwrap();
-        if let Some(&v) = sh.map.get(s) {
-            return FB_TAG | ((v as u64) << 6) | i as u64;
-        }
-        let v = sh.tab.len() as u64;
-        let b: Box<[u8]> = s.into();
-        sh.tab.push(b.clone());
-        sh.map.insert(b, v as u32);
-        FB_TAG | (v << 6) | i as u64
+    fn intern(&self, s: &'static [u8]) -> u64 {
+        let h = hbytes(s);
+        let i = h as usize & (FB_NSH - 1);
+        let v = self.shards[i].0.lock().unwrap().find_or_insert(s, h);
+        FB_TAG | (v << FB_SHIFT) | i as u64
     }
-    /// Resolve a fallback key back to bytes (reads the live shard).
+    /// Resolve a fallback key back to its bytes.
     #[inline]
-    fn get(&self, k: u64) -> &[u8] {
-        let sh = self.shards[(k & ISHARD_MASK) as usize].read().unwrap();
-        let ptr = sh.tab[(k >> 6) as usize & ((1 << 54) - 1)].as_ptr();
-        let len = sh.tab[(k >> 6) as usize & ((1 << 54) - 1)].len();
-        unsafe { std::slice::from_raw_parts(ptr, len) }
+    fn get(&self, k: u64) -> &'static [u8] {
+        let sh = self.shards[k as usize & (FB_NSH - 1)].0.lock().unwrap();
+        sh.tab[((k >> FB_SHIFT) & FB_LOCAL_MASK) as usize]
     }
 }
 
@@ -259,6 +301,8 @@ fn key_of(s: &[u8]) -> u64 {
     if k != u64::MAX {
         return k;
     }
+    // SAFETY: every caller passes a slice of a FILES mmap, mapped until exit.
+    let s: &'static [u8] = unsafe { std::slice::from_raw_parts(s.as_ptr(), s.len()) };
     FB.get().unwrap().intern(s)
 }
 
