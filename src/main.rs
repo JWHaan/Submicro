@@ -1413,9 +1413,7 @@ fn main() {
         slices.push(a);
         rest = b;
     }
-    slices.into_par_iter().for_each(|sl| {
-        sl.sort_unstable_by(|a, b| (a.person, a.ts).cmp(&(b.person, b.ts)))
-    });
+    slices.into_par_iter().for_each(group_sort_ev);
     let evs = ev_arena;
     pt!("ev_sort");
 
@@ -1848,6 +1846,70 @@ fn cid_bytes<'a>(k: u64, p: u32, long: &'a [&'static [u8]], sc: &'a mut [u8; 10]
     } else {
         key_bytes(k, sc)
     }
+}
+
+/// Order a person shard by (person, ts) without a full comparison sort: rank
+/// the shard's few distinct persons (ascending, as the click merge join
+/// expects), counting-sort rows by rank, then sort each person's short run.
+fn group_sort_ev(sl: &mut [Ev]) {
+    let n = sl.len();
+    if n < 64 {
+        sl.sort_unstable_by(|a, b| (a.person, a.ts).cmp(&(b.person, b.ts)));
+        return;
+    }
+    // person -> slot in a small open-addressing table
+    let cap = (n.min(1 << 20) * 2).next_power_of_two().max(64);
+    let mask = cap - 1;
+    let mut keys = vec![u64::MAX; cap]; // person keys are never u64::MAX
+    let mut cnt = vec![0u32; cap];
+    let mut slot_of = vec![0u32; n];
+    for (i, e) in sl.iter().enumerate() {
+        let mut h = (fx64(e.person) >> 20) as usize & mask;
+        loop {
+            let k = keys[h];
+            if k == e.person {
+                break;
+            }
+            if k == u64::MAX {
+                keys[h] = e.person;
+                break;
+            }
+            h = (h + 1) & mask;
+        }
+        cnt[h] += 1;
+        slot_of[i] = h as u32;
+    }
+    let mut persons: Vec<(u64, u32)> = Vec::new();
+    for h in 0..cap {
+        if keys[h] != u64::MAX {
+            persons.push((keys[h], h as u32));
+        }
+    }
+    persons.sort_unstable_by_key(|p| p.0);
+    // cnt[h] becomes the start offset of that person's run
+    let mut off = 0u32;
+    let mut runs: Vec<(u32, u32)> = Vec::with_capacity(persons.len());
+    for &(_, h) in &persons {
+        let c = cnt[h as usize];
+        cnt[h as usize] = off;
+        runs.push((off, c));
+        off += c;
+    }
+    let mut tmp: Vec<Ev> = Vec::with_capacity(n);
+    let dst = tmp.as_mut_ptr();
+    for (i, e) in sl.iter().enumerate() {
+        let h = slot_of[i] as usize;
+        unsafe { *dst.add(cnt[h] as usize) = *e };
+        cnt[h] += 1;
+    }
+    unsafe { tmp.set_len(n) };
+    for &(o, c) in &runs {
+        let r = &mut tmp[o as usize..(o + c) as usize];
+        if c > 1 {
+            r.sort_unstable_by_key(|e| e.ts);
+        }
+    }
+    sl.copy_from_slice(&tmp);
 }
 
 fn reg_buf<T>(out: &mut Vec<(usize, usize)>, v: &Vec<T>) {
