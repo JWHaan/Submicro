@@ -571,7 +571,7 @@ fn shard_sort<T: Copy + Send + Sync, const NSHARD: usize>(
     v: Vec<T>,
     key: impl Fn(&T) -> u64 + Sync,
     fill: T,
-    cmp: impl Fn(&T, &T) -> std::cmp::Ordering + Sync,
+    within: impl Fn(&T, &T) -> std::cmp::Ordering + Sync,
 ) -> Vec<T> {
     let mut cnt = vec![0u32; NSHARD + 1].into_boxed_slice();
     for e in &v {
@@ -597,7 +597,7 @@ fn shard_sort<T: Copy + Send + Sync, const NSHARD: usize>(
     }
     slices
         .into_par_iter()
-        .for_each(|sl| sl.sort_unstable_by(|a, b| cmp(a, b)));
+        .for_each(|sl| group_sort(sl, &key, &within));
     out
 }
 
@@ -1413,7 +1413,9 @@ fn main() {
         slices.push(a);
         rest = b;
     }
-    slices.into_par_iter().for_each(group_sort_ev);
+    slices
+        .into_par_iter()
+        .for_each(|sl| group_sort(sl, |e: &Ev| e.person, |a, b| a.ts.cmp(&b.ts)));
     let evs = ev_arena;
     pt!("ev_sort");
 
@@ -1569,9 +1571,7 @@ fn main() {
     // sort by (person, ts); equal-ts ties broken by click_id BYTES
     pt!("cl_dedup_filter");
     let clicks = shard_sort::<Cl, 256>(clicks, |c| c.person, CL_E, |a, b| {
-        (a.person, a.ts)
-            .cmp(&(b.person, b.ts))
-            .then_with(|| {
+        a.ts.cmp(&b.ts).then_with(|| {
                 if a.cid >> 60 != EID_HASH_TAG && b.cid >> 60 != EID_HASH_TAG {
                     key_cmp(a.cid, b.cid)
                 } else {
@@ -1848,30 +1848,34 @@ fn cid_bytes<'a>(k: u64, p: u32, long: &'a [&'static [u8]], sc: &'a mut [u8; 10]
     }
 }
 
-/// Order a person shard by (person, ts) without a full comparison sort: rank
-/// the shard's few distinct persons (ascending, as the click merge join
+/// Order a person shard by (person, then `within`) without a full comparison
+/// sort: rank the shard's few distinct persons (ascending, as the merge join
 /// expects), counting-sort rows by rank, then sort each person's short run.
-fn group_sort_ev(sl: &mut [Ev]) {
+fn group_sort<T: Copy>(
+    sl: &mut [T],
+    person: impl Fn(&T) -> u64,
+    within: impl Fn(&T, &T) -> std::cmp::Ordering,
+) {
     let n = sl.len();
     if n < 64 {
-        sl.sort_unstable_by(|a, b| (a.person, a.ts).cmp(&(b.person, b.ts)));
+        sl.sort_unstable_by(|a, b| person(a).cmp(&person(b)).then_with(|| within(a, b)));
         return;
     }
-    // person -> slot in a small open-addressing table
     let cap = (n.min(1 << 20) * 2).next_power_of_two().max(64);
     let mask = cap - 1;
     let mut keys = vec![u64::MAX; cap]; // person keys are never u64::MAX
     let mut cnt = vec![0u32; cap];
     let mut slot_of = vec![0u32; n];
     for (i, e) in sl.iter().enumerate() {
-        let mut h = (fx64(e.person) >> 20) as usize & mask;
+        let p = person(e);
+        let mut h = (fx64(p) >> 20) as usize & mask;
         loop {
             let k = keys[h];
-            if k == e.person {
+            if k == p {
                 break;
             }
             if k == u64::MAX {
-                keys[h] = e.person;
+                keys[h] = p;
                 break;
             }
             h = (h + 1) & mask;
@@ -1886,7 +1890,6 @@ fn group_sort_ev(sl: &mut [Ev]) {
         }
     }
     persons.sort_unstable_by_key(|p| p.0);
-    // cnt[h] becomes the start offset of that person's run
     let mut off = 0u32;
     let mut runs: Vec<(u32, u32)> = Vec::with_capacity(persons.len());
     for &(_, h) in &persons {
@@ -1895,7 +1898,7 @@ fn group_sort_ev(sl: &mut [Ev]) {
         runs.push((off, c));
         off += c;
     }
-    let mut tmp: Vec<Ev> = Vec::with_capacity(n);
+    let mut tmp: Vec<T> = Vec::with_capacity(n);
     let dst = tmp.as_mut_ptr();
     for (i, e) in sl.iter().enumerate() {
         let h = slot_of[i] as usize;
@@ -1904,9 +1907,8 @@ fn group_sort_ev(sl: &mut [Ev]) {
     }
     unsafe { tmp.set_len(n) };
     for &(o, c) in &runs {
-        let r = &mut tmp[o as usize..(o + c) as usize];
         if c > 1 {
-            r.sort_unstable_by_key(|e| e.ts);
+            tmp[o as usize..(o + c) as usize].sort_unstable_by(&within);
         }
     }
     sl.copy_from_slice(&tmp);
