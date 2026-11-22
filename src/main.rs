@@ -33,7 +33,11 @@ const D24: i64 = 86_400_000;
 const D7: i64 = 604_800_000;
 const T_INVALID: i64 = i64::MIN;
 const ORGANIC: &[u8] = b"organic";
-const FB_TAG: u64 = 0xF << 60; // fallback key tag (top nibble); packed keys stay below
+const FB_TAG: u64 = 0xF << 60;
+// Event ids that do not pack are only ever compared for equality (dedup), so
+// they are keyed by (EID_HASH_TAG << 60 | 60-bit hash) and never interned.
+// Dedup confirms every key match on these against the source bytes.
+const EID_HASH_TAG: u64 = 0xE; // fallback key tag (top nibble); packed keys stay below
 
 static FILES: OnceLock<Vec<&'static [u8]>> = OnceLock::new();
 thread_local! {
@@ -858,7 +862,7 @@ struct DRec {
 
 // Open-addressing u64 key table over a dedup-record slice; keeps the row
 // index with min `ingest` (first wins ties). Returns surviving indices.
-fn dedup_min_d(rows: &[DRec]) -> Vec<u32> {
+fn dedup_min_d(rows: &[DRec], same: impl Fn(u32, u32) -> bool) -> Vec<u32> {
     let slots = (rows.len().max(16) * 4).next_power_of_two();
     let mut cnt = vec![0u64; slots / 32];
     for r in rows {
@@ -894,7 +898,7 @@ fn dedup_min_d(rows: &[DRec]) -> Vec<u32> {
                 vals[s] = i;
                 break;
             }
-            if keys[s] == r.eid {
+            if keys[s] == r.eid && (r.eid >> 60 != EID_HASH_TAG || same(vals[s], i)) {
                 if r.ingest < rows[vals[s] as usize].ingest {
                     vals[s] = i;
                 }
@@ -1121,13 +1125,15 @@ fn main() {
     // dedup_min_d indexes its counters and probe slots with the low hash
     // bits. Partition by the high bits so the low bits still vary per shard.
     let shard_of = |eid: u64| (fx64(eid) >> (u64::BITS - NSHARD.ilog2())) as usize;
-    let parsed: Vec<(Vec<FEv>, Vec<DIn>, Vec<u32>)> = tasks
+    #[allow(clippy::type_complexity)]
+    let parsed: Vec<(Vec<FEv>, Vec<DIn>, Vec<u32>, Vec<(u32, &'static [u8])>)> = tasks
         .par_iter()
         .map(|t| {
             let b = buf(t.file);
             let mut rows: Vec<FEv> = Vec::with_capacity((t.ce - t.cs) / 64);
             let mut din: Vec<DIn> = Vec::with_capacity((t.ce - t.cs) / 64);
             let mut cnt = vec![0u32; NSHARD];
+            let mut long_eids: Vec<(u32, &'static [u8])> = Vec::new();
             each_line(b, t.cs, t.ce, t.cs == 0, |&[eid, uid, ts_s, ing_s, et_s, prod, price]| {
                 if eid.is_empty() {
                     return;
@@ -1167,7 +1173,13 @@ fn main() {
                 } else {
                     1
                 };
-                let ek = key_of(eid);
+                let ek = match packable(eid) {
+                    u64::MAX => {
+                        long_eids.push((din.len() as u32, eid));
+                        (EID_HASH_TAG << 60) | (hbytes(eid) >> 4)
+                    }
+                    k => k,
+                };
                 cnt[shard_of(ek)] += 1;
                 rows.push(FEv {
                     uid: key_of(uid),
@@ -1181,16 +1193,18 @@ fn main() {
                 });
                 din.push(DIn { eid: ek, ingest });
             });
-            (rows, din, cnt)
+            (rows, din, cnt, long_eids)
         })
         .collect();
     let mut task_rows = Vec::with_capacity(parsed.len());
     let mut dins = Vec::with_capacity(parsed.len());
     let mut cnts = Vec::with_capacity(parsed.len());
-    for (r, d, c) in parsed {
+    let mut long_eids = Vec::with_capacity(parsed.len());
+    for (r, d, c, l) in parsed {
         task_rows.push(r);
         dins.push(d);
         cnts.push(c);
+        long_eids.push(l);
     }
 
     pt!("ev_parse");
@@ -1253,12 +1267,21 @@ fn main() {
 
     // per-eid-shard dedup -> mark surviving flat indices
     let arena_ref = &arena;
+    let long_eids_ref = &long_eids;
     let kept: Vec<AtomicU8> = (0..total).map(|_| AtomicU8::new(0)).collect();
     let kept_ptr = RawPtr::<AtomicU8>(kept.as_ptr() as usize, std::marker::PhantomData);
     (0..NSHARD).into_par_iter().for_each(|s| {
         let rows = &arena_ref[base_ref[s] as usize..base_ref[s + 1] as usize];
         let dst = kept_ptr.0 as *const AtomicU8;
-        for i in dedup_min_d(rows) {
+        // source bytes of a hashed event id, by global row index
+        let eid_bytes = |g: u32| -> &'static [u8] {
+            let t = tbase_ref.partition_point(|&x| x <= g) - 1;
+            let j = g - tbase_ref[t];
+            let l = &long_eids_ref[t];
+            l[l.binary_search_by_key(&j, |e| e.0).unwrap()].1
+        };
+        let same = |a: u32, b: u32| eid_bytes(rows[a as usize].gidx) == eid_bytes(rows[b as usize].gidx);
+        for i in dedup_min_d(rows, same) {
             unsafe {
                 (*dst.add(rows[i as usize].gidx as usize)).store(1, Ordering::Relaxed)
             };
@@ -1266,6 +1289,7 @@ fn main() {
     });
     drop(arena);
     drop(base);
+    drop(long_eids);
     pt!("ev_dedup");
 
     let prod_map_ref = &prod_map;
