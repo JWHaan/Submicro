@@ -1428,17 +1428,28 @@ fn main() {
         }
     }
     let camp_map_ref = &camp_map;
-    let ctask_rows: Vec<Vec<RawCl>> = ctasks
+    // Long click ids are keyed like long event ids (hash under EID_HASH_TAG).
+    // `_p` = 1 + their index in the task's slice list; the scatter below
+    // rebases it to 1 + the index in the flat `long_cids` list.
+    let parsed_cl: Vec<(Vec<RawCl>, Vec<&'static [u8]>)> = ctasks
         .par_iter()
         .map(|t| {
             let b = buf(t.file);
             let mut rows: Vec<RawCl> = Vec::with_capacity((t.ce - t.cs) / 48);
+            let mut long_cids: Vec<&'static [u8]> = Vec::new();
             each_line(b, t.cs, t.ce, t.cs == 0, |&[cid, uid, camp, ts_s]| {
                 if cid.is_empty() {
                     return;
                 }
+                let (ck, cref) = match packable(cid) {
+                    u64::MAX => {
+                        long_cids.push(cid);
+                        ((EID_HASH_TAG << 60) | (hbytes(cid) >> 4), long_cids.len() as u32)
+                    }
+                    k => (k, 0),
+                };
                 rows.push(RawCl {
-                    cid: key_of(cid),
+                    cid: ck,
                     uid: key_of(uid),
                     camp: match camp {
                         [] => u32::MAX,
@@ -1448,18 +1459,30 @@ fn main() {
                         }
                     },
                     ts: parse_ts(ts_s),
-                    _p: 0,
+                    _p: cref,
                 });
             });
-            rows
+            (rows, long_cids)
         })
         .collect();
+    let mut ctask_rows: Vec<Vec<RawCl>> = Vec::with_capacity(parsed_cl.len());
+    let mut long_base: Vec<u32> = Vec::with_capacity(parsed_cl.len());
+    let mut long_cids: Vec<&'static [u8]> = Vec::new();
+    for (r, l) in parsed_cl {
+        ctask_rows.push(r);
+        long_base.push(u32::try_from(long_cids.len()).unwrap());
+        long_cids.extend(l);
+    }
+    let long_cids = &long_cids;
+    let long_base = &long_base;
     pt!("cl_parse");
 
     let cshard_vecs: Vec<Vec<RawCl>> = {
         let sorted: Vec<(Vec<RawCl>, Vec<u32>)> = ctask_rows
             .par_iter()
-            .map(|v| {
+            .enumerate()
+            .map(|(ti, v)| {
+                let lb = long_base[ti];
                 let mut c = vec![0u32; NSHARD];
                 for r in v {
                     c[(fx64(r.cid) >> (u64::BITS - NSHARD.ilog2())) as usize] += 1;
@@ -1475,7 +1498,11 @@ fn main() {
                 let mut flat = vec![RAWC_E; v.len()];
                 for r in v {
                     let s = (fx64(r.cid) >> (u64::BITS - NSHARD.ilog2())) as usize;
-                    flat[pos[s] as usize] = *r;
+                    let mut r = *r;
+                    if r._p != 0 {
+                        r._p += lb;
+                    }
+                    flat[pos[s] as usize] = r;
                     pos[s] += 1;
                 }
                 (flat, offs)
@@ -1502,12 +1529,17 @@ fn main() {
             // first-copy-wins dedup on cid
             let cap = (rows.len().max(16) * 2).next_power_of_two();
             let mut keys = vec![0u64; cap];
+            let mut refs = vec![0u32; cap];
             let mut out = Vec::with_capacity(rows.len());
-            for r in &rows {
+            for (j, r) in rows.iter().enumerate() {
+                if let Some(a) = rows.get(j + 8) {
+                    canon_prefetch(a.uid);
+                }
                 let mut s = (fx64(r.cid) as usize) & (cap - 1);
                 loop {
                     if keys[s] == 0 {
                         keys[s] = r.cid;
+                        refs[s] = r._p;
                         if r.uid != 0
                             && r.ts != T_INVALID
                             && r.ts >= click_lo
@@ -1519,12 +1551,15 @@ fn main() {
                                 ts: r.ts,
                                 camp: r.camp,
                                 cid: r.cid,
-                                _p: 0,
+                                _p: r._p,
                             });
                         }
                         break;
                     }
-                    if keys[s] == r.cid {
+                    if keys[s] == r.cid
+                        && (r.cid >> 60 != EID_HASH_TAG
+                            || long_cids[refs[s] as usize - 1] == long_cids[r._p as usize - 1])
+                    {
                         break;
                     }
                     s = (s + 1) & (cap - 1);
@@ -1538,7 +1573,15 @@ fn main() {
     let clicks = shard_sort::<Cl, 256>(clicks, |c| c.person, CL_E, |a, b| {
         (a.person, a.ts)
             .cmp(&(b.person, b.ts))
-            .then_with(|| key_cmp(a.cid, b.cid))
+            .then_with(|| {
+                if a.cid >> 60 != EID_HASH_TAG && b.cid >> 60 != EID_HASH_TAG {
+                    key_cmp(a.cid, b.cid)
+                } else {
+                    let (mut sa, mut sb) = ([0u8; 10], [0u8; 10]);
+                    cid_bytes(a.cid, a._p, long_cids, &mut sa)
+                        .cmp(cid_bytes(b.cid, b._p, long_cids, &mut sb))
+                }
+            })
     });
     pt!("cl_sort");
 
@@ -1796,6 +1839,15 @@ fn main() {
         parallel_teardown(&regions);
     }
     std::process::exit(0);
+}
+
+/// Click id bytes: hashed ids from their source slice, others from the key.
+fn cid_bytes<'a>(k: u64, p: u32, long: &'a [&'static [u8]], sc: &'a mut [u8; 10]) -> &'a [u8] {
+    if k >> 60 == EID_HASH_TAG {
+        long[p as usize - 1]
+    } else {
+        key_bytes(k, sc)
+    }
 }
 
 fn reg_buf<T>(out: &mut Vec<(usize, usize)>, v: &Vec<T>) {
