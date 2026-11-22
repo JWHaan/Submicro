@@ -1099,12 +1099,20 @@ fn main() {
     const NSHARD: usize = 256;
     let canon_cell: std::sync::OnceLock<(U64Map, Vec<u64>, usize)> =
         std::sync::OnceLock::new();
+    let mut clicks_cell: std::sync::OnceLock<Vec<Cl>> = std::sync::OnceLock::new();
+    let (canon_tx, canon_rx) = std::sync::mpsc::channel::<()>();
+    let (clicks_tx, clicks_rx) = std::sync::mpsc::channel::<()>();
+    // Receivers are !Sync; Mutex makes the &refs captured by the scope Send.
+    let canon_rx = std::sync::Mutex::new(canon_rx);
+    let clicks_rx = std::sync::Mutex::new(clicks_rx);
 
-    let (evs, clicks) = std::thread::scope(|s| {
+    let evs = rayon::scope(|s| {
         // links -> union-find over u64 keys -> canon map. The UF build is
-        // mostly serial and isn't consumed until ev_filter, so it runs on a
-        // side thread overlapped with event parsing on the shared pool.
-        let links_thread = s.spawn(|| {
+        // mostly serial and isn't consumed until ev_filter, so it runs as a
+        // rayon task overlapped with event parsing on the shared pool.
+        let canon_tx = &canon_tx;
+        let canon_cell = &canon_cell;
+        s.spawn(move |_| {
             let link_tasks: Vec<(u16, usize, usize)> = (ncl..nln)
             .flat_map(|fi| {
                 line_chunks(buf(fi as u16), ncpu * 2)
@@ -1168,7 +1176,8 @@ fn main() {
             let bi = (fx64(k) as usize) & bmask;
             bloom[bi >> 6] |= 1 << (bi & 63);
         }
-            (m, bloom, bmask)
+            canon_cell.set((m, bloom, bmask)).ok().unwrap();
+            canon_tx.send(()).unwrap();
         });
 
     // ---------------- events ----------------
@@ -1351,7 +1360,7 @@ fn main() {
     drop(long_eids);
     pt!("ev_dedup");
 
-    canon_cell.set(links_thread.join().unwrap()).ok().unwrap();
+    canon_rx.lock().unwrap().recv().unwrap();
     let &(ref canon_map, ref cbloom, cbmask) = canon_cell.get().unwrap();
     let canon_prefetch = |k: u64| {
         let h = fx64(k) as usize;
@@ -1373,7 +1382,9 @@ fn main() {
     let canon_map_c = canon_map;
     let cbloom_c = cbloom;
     let camp_map_c = &camp_map;
-    let cl_thread = s.spawn(move || {
+    let clicks_tx = &clicks_tx;
+    let clicks_cell_r = &clicks_cell;
+    s.spawn(move |_| {
         let canon_prefetch = |k: u64| {
             let h = fx64(k) as usize;
             if cbloom_c[(h & cbmask) >> 6] >> (h & 63) & 1 != 0 {
@@ -1553,7 +1564,8 @@ fn main() {
             })
         });
         pt!("cl_sort");
-        clicks
+        clicks_cell_r.set(clicks).ok().unwrap();
+        clicks_tx.send(()).unwrap();
     });
 
     let prod_map_ref = &prod_map;
@@ -1656,9 +1668,10 @@ fn main() {
     let evs = ev_arena;
     pt!("ev_sort");
 
-    let clicks = cl_thread.join().unwrap();
-        (evs, clicks)
+    clicks_rx.lock().unwrap().recv().unwrap();
+        evs
     });
+    let clicks = clicks_cell.take().unwrap();
 
     // ---------------- sessionize + attribute ----------------
     let ev_runs = person_runs(&evs, |e| e.person);
