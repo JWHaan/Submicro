@@ -534,35 +534,17 @@ struct Ev {
 
 
 #[derive(Clone, Copy)]
-struct RawCl {
-    cid: u64,
-    uid: u64,
-    camp: u32, // campaign idx, u32::MAX = unknown
-    ts: i64,
-    _p: u32,
-}
-const RAWC_E: RawCl = RawCl {
-    cid: 0,
-    uid: 0,
-    camp: 0,
-    ts: 0,
-    _p: 0,
-};
-
-#[derive(Clone, Copy)]
 struct Cl {
     person: u64,
     ts: i64,
     camp: u32,
-    cid: u64, // key; byte order needed only for equal-ts ties
-    _p: u32,
+    cid: &'static [u8], // borrowed from the input mmap; read only on ties
 }
 const CL_E: Cl = Cl {
     person: 0,
     ts: 0,
     camp: 0,
-    cid: 0,
-    _p: 0,
+    cid: &[],
 };
 
 /// Bucket `v` into NSHARD shards by key hash, sort each shard in parallel,
@@ -1427,159 +1409,37 @@ fn main() {
             ctasks.push(Task { file: fi, cs, ce });
         }
     }
-    let camp_map_ref = &camp_map;
-    // Long click ids are keyed like long event ids (hash under EID_HASH_TAG).
-    // `_p` = 1 + their index in the task's slice list; the scatter below
-    // rebases it to 1 + the index in the flat `long_cids` list.
-    let parsed_cl: Vec<(Vec<RawCl>, Vec<&'static [u8]>)> = ctasks
+    // Click copies have identical values: they cannot change the winning
+    // (ts, cid), and Alive counts each active campaign once per session.
+    // Unlike events, clicks need no global arbitration before validation.
+    let clicks: Vec<Cl> = ctasks
         .par_iter()
-        .map(|t| {
+        .flat_map_iter(|t| {
             let b = buf(t.file);
-            let mut rows: Vec<RawCl> = Vec::with_capacity((t.ce - t.cs) / 48);
-            let mut long_cids: Vec<&'static [u8]> = Vec::new();
+            let mut rows = Vec::with_capacity((t.ce - t.cs) / 48);
             each_line(b, t.cs, t.ce, t.cs == 0, |&[cid, uid, camp, ts_s]| {
-                if cid.is_empty() {
+                if cid.is_empty() || uid.is_empty() || camp.is_empty() {
                     return;
                 }
-                let (ck, cref) = match packable(cid) {
-                    u64::MAX => {
-                        long_cids.push(cid);
-                        ((EID_HASH_TAG << 60) | (hbytes(cid) >> 4), long_cids.len() as u32)
-                    }
-                    k => (k, 0),
-                };
-                rows.push(RawCl {
-                    cid: ck,
-                    uid: key_of(uid),
-                    camp: match camp {
-                        [] => u32::MAX,
-                        _ => {
-                            let ck = key_of(camp);
-                            camp_map_ref.get(ck).map(|v| v as u32).unwrap_or(u32::MAX)
-                        }
-                    },
-                    ts: parse_ts(ts_s),
-                    _p: cref,
-                });
+                let ts = parse_ts(ts_s);
+                if ts == T_INVALID || ts < click_lo || ts >= we {
+                    return;
+                }
+                if let Some(camp) = camp_map.get(key_of(camp)) {
+                    rows.push(Cl {
+                        person: canon_of(key_of(uid)),
+                        ts,
+                        camp: camp as u32,
+                        cid,
+                    });
+                }
             });
-            (rows, long_cids)
+            rows
         })
         .collect();
-    let mut ctask_rows: Vec<Vec<RawCl>> = Vec::with_capacity(parsed_cl.len());
-    let mut long_base: Vec<u32> = Vec::with_capacity(parsed_cl.len());
-    let mut long_cids: Vec<&'static [u8]> = Vec::new();
-    for (r, l) in parsed_cl {
-        ctask_rows.push(r);
-        long_base.push(u32::try_from(long_cids.len()).unwrap());
-        long_cids.extend(l);
-    }
-    let long_cids = &long_cids;
-    let long_base = &long_base;
     pt!("cl_parse");
-
-    let cshard_vecs: Vec<Vec<RawCl>> = {
-        let sorted: Vec<(Vec<RawCl>, Vec<u32>)> = ctask_rows
-            .par_iter()
-            .enumerate()
-            .map(|(ti, v)| {
-                let lb = long_base[ti];
-                let mut c = vec![0u32; NSHARD];
-                for r in v {
-                    c[(fx64(r.cid) >> (u64::BITS - NSHARD.ilog2())) as usize] += 1;
-                }
-                let mut offs = Vec::with_capacity(NSHARD + 1);
-                let mut acc = 0u32;
-                for s in 0..NSHARD {
-                    offs.push(acc);
-                    acc += c[s];
-                }
-                offs.push(acc);
-                let mut pos = offs.clone();
-                let mut flat = vec![RAWC_E; v.len()];
-                for r in v {
-                    let s = (fx64(r.cid) >> (u64::BITS - NSHARD.ilog2())) as usize;
-                    let mut r = *r;
-                    if r._p != 0 {
-                        r._p += lb;
-                    }
-                    flat[pos[s] as usize] = r;
-                    pos[s] += 1;
-                }
-                (flat, offs)
-            })
-            .collect();
-        (0..NSHARD)
-            .into_par_iter()
-            .map(|s| {
-                let n: usize = sorted.iter().map(|(_, o)| (o[s + 1] - o[s]) as usize).sum();
-                let mut v = Vec::with_capacity(n);
-                for (flat, offs) in &sorted {
-                    v.extend_from_slice(&flat[offs[s] as usize..offs[s + 1] as usize]);
-                }
-                v
-            })
-            .collect()
-    };
-    drop(ctask_rows);
-    pt!("cl_scatter");
-
-    let clicks: Vec<Cl> = cshard_vecs
-        .into_par_iter()
-        .flat_map(|rows| {
-            // first-copy-wins dedup on cid
-            let cap = (rows.len().max(16) * 2).next_power_of_two();
-            let mut keys = vec![0u64; cap];
-            let mut refs = vec![0u32; cap];
-            let mut out = Vec::with_capacity(rows.len());
-            for (j, r) in rows.iter().enumerate() {
-                if let Some(a) = rows.get(j + 8) {
-                    canon_prefetch(a.uid);
-                }
-                let mut s = (fx64(r.cid) as usize) & (cap - 1);
-                loop {
-                    if keys[s] == 0 {
-                        keys[s] = r.cid;
-                        refs[s] = r._p;
-                        if r.uid != 0
-                            && r.ts != T_INVALID
-                            && r.ts >= click_lo
-                            && r.ts < we
-                            && r.camp != u32::MAX
-                        {
-                            out.push(Cl {
-                                person: canon_of(r.uid),
-                                ts: r.ts,
-                                camp: r.camp,
-                                cid: r.cid,
-                                _p: r._p,
-                            });
-                        }
-                        break;
-                    }
-                    if keys[s] == r.cid
-                        && (r.cid >> 60 != EID_HASH_TAG
-                            || long_cids[refs[s] as usize - 1] == long_cids[r._p as usize - 1])
-                    {
-                        break;
-                    }
-                    s = (s + 1) & (cap - 1);
-                }
-            }
-            out
-        })
-        .collect();
-    // sort by (person, ts); equal-ts ties broken by click_id BYTES
-    pt!("cl_dedup_filter");
-    let clicks = shard_sort::<Cl, 256>(clicks, |c| c.person, CL_E, |a, b| {
-        a.ts.cmp(&b.ts).then_with(|| {
-                if a.cid >> 60 != EID_HASH_TAG && b.cid >> 60 != EID_HASH_TAG {
-                    key_cmp(a.cid, b.cid)
-                } else {
-                    let (mut sa, mut sb) = ([0u8; 10], [0u8; 10]);
-                    cid_bytes(a.cid, a._p, long_cids, &mut sa)
-                        .cmp(cid_bytes(b.cid, b._p, long_cids, &mut sb))
-                }
-            })
+    let clicks = shard_sort::<Cl, NSHARD>(clicks, |c| c.person, CL_E, |a, b| {
+        a.ts.cmp(&b.ts).then_with(|| a.cid.cmp(b.cid))
     });
     pt!("cl_sort");
 
@@ -1837,15 +1697,6 @@ fn main() {
         parallel_teardown(&regions);
     }
     std::process::exit(0);
-}
-
-/// Click id bytes: hashed ids from their source slice, others from the key.
-fn cid_bytes<'a>(k: u64, p: u32, long: &'a [&'static [u8]], sc: &'a mut [u8; 10]) -> &'a [u8] {
-    if k >> 60 == EID_HASH_TAG {
-        long[p as usize - 1]
-    } else {
-        key_bytes(k, sc)
-    }
 }
 
 /// Order a person shard by (person, then `within`) without a full comparison
