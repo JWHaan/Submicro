@@ -15,12 +15,17 @@ on:
         description: Include the uncompressed writer as a third timed arm
         type: boolean
         default: false
+      profile:
+        description: Skip the A/B; perf-profile this checkout instead
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   bench:
+    if: ${{ !inputs.profile }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     defaults:
@@ -81,3 +86,46 @@ jobs:
           du -sh data; df -h .
       - name: Interleave full container runs and compare decoded tables
         run: python3 .github/bench.py
+
+  profile:
+    if: ${{ inputs.profile }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      EVENTS: ${{ inputs.events }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools, kit and data
+        run: |
+          [[ "$EVENTS" =~ ^[0-9]{7,8}$ ]]
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)" >/dev/null 2>&1 \
+            || sudo apt-get install -y -qq linux-tools-common linux-tools-azure >/dev/null
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          lscpu | grep -E 'Model name|^CPU\(s\)|L2|L3'
+          curl --retry 3 -fsSLo generator.zip https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
+          echo "78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a  generator.zip" | sha256sum -c
+          unzip -q generator.zip -d "$RUNNER_TEMP/kit"
+          cargo build --offline --release --manifest-path "$RUNNER_TEMP/kit/generator/Cargo.toml"
+          "$RUNNER_TEMP/kit/generator/target/release/generate" --seed "$((EVENTS/1000+17))" \
+            --events "$EVENTS" --clicks "$((EVENTS/4))" --output "$RUNNER_TEMP/data"
+      - name: Build with symbols
+        run: |
+          CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_PROFILE_RELEASE_STRIP=none \
+          RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes" \
+            cargo build --release --locked --bin shopping-sessions
+      - name: Phases, counters and hot symbols
+        run: |
+          B=target/release/shopping-sessions
+          run() { rm -rf "$RUNNER_TEMP/out"; mkdir "$RUNNER_TEMP/out"; DATA_DIR="$RUNNER_TEMP/data" OUTPUT_DIR="$RUNNER_TEMP/out" NCPU=$(nproc) "$@"; }
+          run $B; run $B   # warm the page cache
+          for i in 1 2 3; do run env PHASE_TIMING=1 /usr/bin/time -f 'wall %e s user %U sys %S maxrss %M KB' $B; echo; done
+          run perf stat -e task-clock,cycles,instructions,cache-misses,LLC-load-misses,dTLB-load-misses,page-faults $B 2>&1 | tail -20
+          run perf record -F 2999 -g -o perf.data $B 2>/dev/null
+          echo "===== flat (self time) ====="
+          perf report -i perf.data --no-children --sort symbol --stdio 2>/dev/null | grep -v '^#' | grep -E '^ +[0-9]' | head -45
+          echo "===== inclusive ====="
+          perf report -i perf.data --children --sort symbol --stdio 2>/dev/null | grep -v '^#' | grep -E '^ +[0-9]' | head -30
