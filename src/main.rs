@@ -1118,7 +1118,9 @@ fn main() {
             tasks.push(Task { file: fi, cs, ce });
         }
     }
-    let shard_of = |eid: u64| (fx64(eid) as usize) & (NSHARD - 1);
+    // dedup_min_d indexes its counters and probe slots with the low hash
+    // bits. Partition by the high bits so the low bits still vary per shard.
+    let shard_of = |eid: u64| (fx64(eid) >> (u64::BITS - NSHARD.ilog2())) as usize;
     let parsed: Vec<(Vec<FEv>, Vec<DIn>, Vec<u32>)> = tasks
         .par_iter()
         .map(|t| {
@@ -1405,7 +1407,7 @@ fn main() {
             .map(|v| {
                 let mut c = vec![0u32; NSHARD];
                 for r in v {
-                    c[(fx64(r.cid) as usize) & (NSHARD - 1)] += 1;
+                    c[(fx64(r.cid) >> (u64::BITS - NSHARD.ilog2())) as usize] += 1;
                 }
                 let mut offs = Vec::with_capacity(NSHARD + 1);
                 let mut acc = 0u32;
@@ -1417,7 +1419,7 @@ fn main() {
                 let mut pos = offs.clone();
                 let mut flat = vec![RAWC_E; v.len()];
                 for r in v {
-                    let s = (fx64(r.cid) as usize) & (NSHARD - 1);
+                    let s = (fx64(r.cid) >> (u64::BITS - NSHARD.ilog2())) as usize;
                     flat[pos[s] as usize] = *r;
                     pos[s] += 1;
                 }
